@@ -26,13 +26,6 @@
         lua_shared_dict pow_rate_limit 10m;
         access_by_lua_file /path/to/pow_ddos_challenge.lua;
     
-    Environment variables:
-        POW_SECRET      - HMAC secret key (REQUIRED for production)
-        POW_DIFFICULTY  - Base difficulty, 1-6 (default: 3, each level ~16x harder)
-        POW_EXPIRE      - Session duration in seconds (default: 86400 = 1 day)
-        POW_RATE_LIMIT  - Max challenge requests per IP per minute (default: 10)
-        POW_PROXY_MODE  - IP detection: "direct", "cloudflare", or "proxy" (default: direct)
-    
     Challenge Format:
         signature-timestamp-difficulty
         The signature covers IP + timestamp + difficulty + secret, preventing tampering.
@@ -49,19 +42,13 @@
     License: MIT
 ]]
 
--- Configuration
-local config = {
-    secret = os.getenv("POW_SECRET") or "put-here-your-own-large-secret",
-    difficulty = tonumber(os.getenv("POW_DIFFICULTY")) or 3,
-    expire_time = tonumber(os.getenv("POW_EXPIRE")) or 86400,
-    rate_limit = tonumber(os.getenv("POW_RATE_LIMIT")) or 10,
-    -- Proxy mode: "cloudflare", "proxy", or "direct"
-    -- Only trust forwarded headers when explicitly configured
-    proxy_mode = os.getenv("POW_PROXY_MODE") or "direct",
-}
+-- NOTE: This file gets placed in /etc/nginx/snippets
 
--- Clamp difficulty to safe range (1-6)
-config.difficulty = math.max(1, math.min(6, config.difficulty))
+-- Initialize module
+local _M = {}
+
+-- Configuration
+local config = require("pow_ddos_config")
 
 -- Shared memory for rate limiting
 local rate_limit_dict = ngx.shared.pow_rate_limit
@@ -192,8 +179,8 @@ end
 
 -- Verify SHA256 solution (check leading zeros on server)
 local function verify_solution(challenge, nonce, difficulty)
-    local resty_sha256 = require "resty.sha256"
-    local str = require "resty.string"
+    local resty_sha256 = require "nginx.sha256"
+    local str = require "nginx.string"
     
     local sha = resty_sha256:new()
     sha:update(challenge .. nonce)
@@ -213,124 +200,131 @@ local function log_challenge(event, ip, data)
     ngx.log(ngx.INFO, msg)
 end
 
--- Main logic
-local remote_addr = get_client_ip()
-local currenttime = ngx.time()
+-- Main logic is a function that either returns to continue the lua_block in nginx or returns an error response
+function _M.check(custom_difficulty)
+    local pow_difficulty = custom_difficulty or 3
 
--- Cookie names (unique per client)
-local cookie_token = "_pow_" .. signature(remote_addr .. "token"):sub(1, 8)
-local cookie_exp = "_pow_" .. signature(remote_addr .. "exp"):sub(1, 8)
+    -- Clamp difficulty to safe range (1-6)
+    pow_difficulty = math.max(1, math.min(6, pow_difficulty))
 
--- Check existing valid session
-local token = ngx.var["cookie_" .. cookie_token] or ""
-local exp = tonumber(ngx.var["cookie_" .. cookie_exp] or "0")
-local expected_token = signature(remote_addr .. config.secret .. math.floor(currenttime / config.expire_time))
+    -- Main logic
+    local remote_addr = get_client_ip()
+    local currenttime = ngx.time()
 
-if token == expected_token and exp > currenttime then
-    return ngx.exit(ngx.OK)  -- Valid session
-end
+    -- Cookie names (unique per client)
+    local cookie_token = "_pow_" .. signature(remote_addr .. "token"):sub(1, 8)
+    local cookie_exp = "_pow_" .. signature(remote_addr .. "exp"):sub(1, 8)
 
--- Rate limiting check
-local rate_ok, rate_count = check_rate_limit(remote_addr)
-if not rate_ok then
-    log_challenge("RATE_LIMITED", remote_addr, { count = rate_count, limit = config.rate_limit })
-    ngx.status = 429
-    ngx.header["Retry-After"] = "60"
-    ngx.header["Content-Type"] = "text/plain"
-    ngx.say("Too many requests. Please wait a minute.")
-    return ngx.exit(429)
-end
+    -- Check existing valid session
+    local token = ngx.var["cookie_" .. cookie_token] or ""
+    local exp = tonumber(ngx.var["cookie_" .. cookie_exp] or "0")
+    local expected_token = signature(remote_addr .. config.secret .. math.floor(currenttime / config.expire_time))
 
--- Handle PoW solution submission
-local headers = ngx.req.get_headers()
-if headers["x-pow-challenge"] and headers["x-pow-nonce"] then
-    local challenge = headers["x-pow-challenge"]
-    local nonce = headers["x-pow-nonce"]
-    local solve_time = tonumber(headers["x-pow-time"]) or 0
-    
-    -- Verify challenge signature and extract server-signed difficulty
-    local challenge_valid, server_difficulty, ts = verify_challenge(challenge, remote_addr)
-    
-    if not challenge_valid then
-        log_challenge("INVALID_CHALLENGE", remote_addr, { challenge = challenge:sub(1, 20) })
-        ngx.status = 403
-        ngx.say("Invalid challenge")
-        return ngx.exit(403)
+    if token == expected_token and exp > currenttime then
+        return  -- Valid session
     end
-    
-    -- Verify timestamp (prevent replay after expiry)
-    if currenttime - ts > 300 then  -- 5 minute expiry
-        log_challenge("EXPIRED", remote_addr, { age = currenttime - ts })
-        ngx.status = 403
-        ngx.say("Challenge expired")
-        return ngx.exit(403)
+
+    -- Rate limiting check
+    local rate_ok, rate_count = check_rate_limit(remote_addr)
+    if not rate_ok then
+        log_challenge("RATE_LIMITED", remote_addr, { count = rate_count, limit = config.rate_limit })
+        ngx.status = 429
+        ngx.header["Retry-After"] = "60"
+        ngx.header["Content-Type"] = "text/plain"
+        ngx.say("Too many requests. Please wait a minute.")
+        return ngx.exit(429)
     end
-    
-    -- Prevent nonce replay (same challenge+nonce can only be used once)
-    if rate_limit_dict then
-        local nonce_key = "nonce:" .. challenge .. ":" .. nonce
-        local exists = rate_limit_dict:get(nonce_key)
-        if exists then
-            log_challenge("NONCE_REPLAY", remote_addr, { nonce = nonce })
+
+    -- Handle PoW solution submission
+    local headers = ngx.req.get_headers()
+    if headers["x-pow-challenge"] and headers["x-pow-nonce"] then
+        local challenge = headers["x-pow-challenge"]
+        local nonce = headers["x-pow-nonce"]
+        local solve_time = tonumber(headers["x-pow-time"]) or 0
+        
+        -- Verify challenge signature and extract server-signed difficulty
+        local challenge_valid, server_difficulty, ts = verify_challenge(challenge, remote_addr)
+        
+        if not challenge_valid then
+            log_challenge("INVALID_CHALLENGE", remote_addr, { challenge = challenge:sub(1, 20) })
             ngx.status = 403
-            ngx.say("Nonce already used")
+            ngx.say("Invalid challenge")
+            return ngx.exit(403)
+        end
+        
+        -- Verify timestamp (prevent replay after expiry)
+        if currenttime - ts > 300 then  -- 5 minute expiry
+            log_challenge("EXPIRED", remote_addr, { age = currenttime - ts })
+            ngx.status = 403
+            ngx.say("Challenge expired")
+            return ngx.exit(403)
+        end
+        
+        -- Prevent nonce replay (same challenge+nonce can only be used once)
+        if rate_limit_dict then
+            local nonce_key = "nonce:" .. challenge .. ":" .. nonce
+            local exists = rate_limit_dict:get(nonce_key)
+            if exists then
+                log_challenge("NONCE_REPLAY", remote_addr, { nonce = nonce })
+                ngx.status = 403
+                ngx.say("Nonce already used")
+                return ngx.exit(403)
+            end
+        end
+        
+        -- Verify PoW solution with SERVER-SIGNED difficulty (not client-supplied!)
+        local valid, hash = verify_solution(challenge, nonce, server_difficulty)
+        
+        if valid then
+            -- Store nonce to prevent replay (TTL = challenge expiry)
+            if rate_limit_dict then
+                local nonce_key = "nonce:" .. challenge .. ":" .. nonce
+                rate_limit_dict:set(nonce_key, true, 300)  -- 5 min TTL
+            end
+            
+            local expire_ts = currenttime + config.expire_time
+            local new_token = signature(remote_addr .. config.secret .. math.floor(currenttime / config.expire_time))
+            
+            log_challenge("VERIFIED", remote_addr, {
+                nonce = nonce,
+                difficulty = server_difficulty,
+                solve_time_ms = solve_time,
+                hash_prefix = hash:sub(1, 8)
+            })
+            
+            ngx.header["Set-Cookie"] = {
+                cookie_token .. "=" .. new_token .. "; path=/; Max-Age=" .. config.expire_time .. "; SameSite=Lax; HttpOnly",
+                cookie_exp .. "=" .. expire_ts .. "; path=/; Max-Age=" .. config.expire_time .. "; SameSite=Lax"
+            }
+            ngx.status = 204
+            return ngx.exit(204)
+        else
+            log_challenge("INVALID", remote_addr, { nonce = nonce, difficulty = server_difficulty })
+            ngx.status = 403
+            ngx.say("Invalid solution")
             return ngx.exit(403)
         end
     end
-    
-    -- Verify PoW solution with SERVER-SIGNED difficulty (not client-supplied!)
-    local valid, hash = verify_solution(challenge, nonce, server_difficulty)
-    
-    if valid then
-        -- Store nonce to prevent replay (TTL = challenge expiry)
-        if rate_limit_dict then
-            local nonce_key = "nonce:" .. challenge .. ":" .. nonce
-            rate_limit_dict:set(nonce_key, true, 300)  -- 5 min TTL
-        end
-        
-        local expire_ts = currenttime + config.expire_time
-        local new_token = signature(remote_addr .. config.secret .. math.floor(currenttime / config.expire_time))
-        
-        log_challenge("VERIFIED", remote_addr, {
-            nonce = nonce,
-            difficulty = server_difficulty,
-            solve_time_ms = solve_time,
-            hash_prefix = hash:sub(1, 8)
-        })
-        
-        ngx.header["Set-Cookie"] = {
-            cookie_token .. "=" .. new_token .. "; path=/; Max-Age=" .. config.expire_time .. "; SameSite=Lax; HttpOnly",
-            cookie_exp .. "=" .. expire_ts .. "; path=/; Max-Age=" .. config.expire_time .. "; SameSite=Lax"
-        }
-        ngx.status = 204
-        return ngx.exit(204)
-    else
-        log_challenge("INVALID", remote_addr, { nonce = nonce, difficulty = server_difficulty })
-        ngx.status = 403
-        ngx.say("Invalid solution")
-        return ngx.exit(403)
-    end
-end
 
--- Calculate difficulty based on server-side detection
-local server_suspicion = detect_server_suspicion()
-local effective_difficulty = math.min(config.difficulty + math.floor(server_suspicion / 2), 6)
+    -- Calculate difficulty based on server-side detection
+    local server_suspicion = detect_server_suspicion()
+    local effective_difficulty = math.min(pow_difficulty + math.floor(server_suspicion / 2), 6)
 
--- Generate new challenge with embedded difficulty
-local challenge = generate_challenge(remote_addr, effective_difficulty)
-log_challenge("ISSUED", remote_addr, { 
-    base_difficulty = config.difficulty, 
-    server_suspicion = server_suspicion,
-    effective_difficulty = effective_difficulty,
-    rate_count = rate_count 
-})
+    -- Generate new challenge with embedded difficulty
+    local challenge = generate_challenge(remote_addr, effective_difficulty)
+    log_challenge("ISSUED", remote_addr, { 
+        base_difficulty = pow_difficulty, 
+        server_suspicion = server_suspicion,
+        effective_difficulty = effective_difficulty,
+        rate_count = rate_count 
+    })
 
--- Serve challenge page
-ngx.status = 503
-ngx.header["Content-Type"] = "text/html; charset=utf-8"
-ngx.header["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    -- Serve challenge page
+    ngx.status = 503
+    ngx.header["Content-Type"] = "text/html; charset=utf-8"
+    ngx.header["Cache-Control"] = "no-store, no-cache, must-revalidate"
 
-local html = [[<!DOCTYPE html>
+    local html = [[<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -542,5 +536,8 @@ local html = [[<!DOCTYPE html>
 </body>
 </html>]]
 
-ngx.say(html)
-ngx.exit(503)
+    ngx.say(html)
+    ngx.exit(503)
+end
+
+return _M

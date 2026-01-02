@@ -2,6 +2,56 @@
 
 A cryptographic proof-of-work challenge system for Nginx/OpenResty that provides robust protection against DDoS attacks, automated scrapers, and AI-powered bots.
 
+## Differences from upstream version
+
+This version is tailored to Ubuntu (24.04) namings and locations, and re-worked as a module for additional lua code within nginx blocks.
+
+Environment variable code has been removed in favor of a separate config file and defining difficulty in lua block.
+
+### Requirements
+- libnginx-mod-http-lua
+- lua-nginx-string
+
+### Sample Nginx Configuration
+
+```nginx
+http {
+    server {
+
+        # Apply PoW challenge to all requests (or specific locations)
+        access_by_lua_block {
+            -- Define difficulty for additional customizations before running PoW test.
+            local difficulty = 3
+
+            -- Example: You could boost based on a Nginx map
+            if ngx.var.bad_bot == "1" then
+                difficulty = difficulty + 1
+            end
+
+            -- Example: Skip PoW for whitelisted URIs
+            if ngx.var.bypass_uri == "1" then
+                return ngx.OK
+            end
+
+            local pow = require("pow_ddos_challenge")
+            pow.check(difficulty)
+
+            -- If check() hits a valid session, it simply returns and we reach here.
+            -- If it hits an error or needs to show a challenge, it exits the request entirely.
+
+            -- Additional lua code could go here
+        }
+        
+        # Your normal configuration...
+        location / {
+            # Whatever
+        }
+    }
+}
+```
+
+# (Stock Readme Below)
+
 ## How It Works
 
 ```
