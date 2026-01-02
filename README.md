@@ -30,7 +30,7 @@ http {
 
             -- Example: Skip PoW for whitelisted URIs
             if ngx.var.bypass_uri == "1" then
-                return ngx.OK
+                return ngx.exit(ngx.OK)
             end
 
             local pow = require("pow_ddos_challenge")
@@ -46,6 +46,7 @@ http {
         location / {
             # Whatever
         }
+
     }
 }
 ```
