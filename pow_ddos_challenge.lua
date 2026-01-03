@@ -53,12 +53,22 @@ local config = require("pow_ddos_config")
 -- Shared memory for rate limiting
 local rate_limit_dict = ngx.shared.pow_rate_limit
 
--- Cloudflare uses 403 on their anti-bot page as they found 503 could confuse legitimate clients and some browsers.
-local challenge_status_code = 403
+-- These create "shortcuts" to the Nginx internal tables, which is faster for the LuaJIT compiler to process.
+-- local ngx_status = ngx.status --- IGNORE: Does not work correctly ---
+local ngx_var = ngx.var
+local ngx_header = ngx.header
+local ngx_time = ngx.time
+local ngx_log = ngx.log
+local ngx_say = ngx.say
+local ngx_req = ngx.req
+local ngx_exit = ngx.exit
+local INFO = ngx.INFO
+local encode_base64 = ngx.encode_base64
+local hmac_sha1 = ngx.hmac_sha1
 
 -- Utility: Generate HMAC signature
 local function signature(str)
-    local hash = ngx.encode_base64(ngx.hmac_sha1(config.secret, str))
+    local hash = encode_base64(hmac_sha1(config.secret, str))
     return hash:gsub("[+]", "-"):gsub("[/]", "_"):gsub("[=]", "")
 end
 
@@ -66,28 +76,28 @@ end
 local function get_client_ip()
     if config.proxy_mode == "cloudflare" then
         -- Only trust CF header when behind Cloudflare
-        return ngx.var.http_cf_connecting_ip or ngx.var.remote_addr
+        return ngx_var.http_cf_connecting_ip or ngx_var.remote_addr
     elseif config.proxy_mode == "proxy" then
         -- Trust X-Forwarded-For only when behind trusted proxy
-        local xff = ngx.var.http_x_forwarded_for
+        local xff = ngx_var.http_x_forwarded_for
         if xff then
             -- Take first IP (original client) from comma-separated list
             return xff:match("^%s*([^,]+)")
         end
-        return ngx.var.remote_addr
+        return ngx_var.remote_addr
     else
         -- Direct mode: only trust actual remote address
         -- Log warning if forwarded headers are present (potential spoofing attempt)
-        if ngx.var.http_x_forwarded_for or ngx.var.http_cf_connecting_ip then
-            ngx.log(ngx.WARN, "[PoW] Forwarded headers present but proxy_mode=direct, ignoring")
+        if ngx_var.http_x_forwarded_for or ngx_var.http_cf_connecting_ip then
+            ngx_log(ngx.WARN, "[PoW] Forwarded headers present but proxy_mode=direct, ignoring")
         end
-        return ngx.var.remote_addr
+        return ngx_var.remote_addr
     end
 end
 
 -- Server-side bot detection from HTTP headers
 local function detect_server_suspicion()
-    local headers = ngx.req.get_headers()
+    local headers = ngx_req.get_headers()
     local score = 0
     
     -- Missing Accept-Language (all real browsers send this)
@@ -101,14 +111,24 @@ local function detect_server_suspicion()
     end
     
     -- Missing or suspicious User-Agent
-    local ua = headers["user-agent"] or ""
-    if ua == "" then
+    local ua = headers["user-agent"]
+    if type(ua) == "string" then
+        if ua == "" then
+            score = score + 3
+        elseif ua:match("^curl") or ua:match("^wget") or ua:match("^python") 
+               or ua:match("^Go%-http") or ua:match("^Java") or ua:match("^Ruby")
+               or ua:match("bot") or ua:match("Bot") or ua:match("crawler") 
+               or ua:match("spider") or ua:match("scraper") then
+            score = score + 2
+        end
+    else
+        -- Not a string (nil, table, etc) - treat as missing/suspicious
         score = score + 3
-    elseif ua:match("^curl") or ua:match("^wget") or ua:match("^python") 
-           or ua:match("^Go%-http") or ua:match("^Java") or ua:match("^Ruby")
-           or ua:match("bot") or ua:match("Bot") or ua:match("crawler") 
-           or ua:match("spider") or ua:match("scraper") then
-        score = score + 2
+
+        -- Missing User-Agent AND Referer is definitely a bot
+        if not headers["referer"] then
+            score = score + 2
+        end
     end
     
     -- Missing Sec-Fetch headers (modern browsers always send these)
@@ -116,26 +136,36 @@ local function detect_server_suspicion()
         -- Could be older browser, minor penalty
         score = score + 1
     end
-    
+
+    -- Missing DNT header (most browsers send it)
+    if not headers["dnt"] then
+        score = score + 1
+    end
+
     -- Missing Accept header
     if not headers["accept"] then
         score = score + 1
     end
     
     -- Connection header anomalies
-    local conn = headers["connection"] or ""
-    if conn:lower() == "close" then
+    local conn = headers["connection"]
+    if type(conn) == "string" and conn:lower() == "close" then
         -- Scrapers often use Connection: close
         score = score + 1
     end
-    
+
+    -- HTTP/1.0 in 2026 (very old or bot)
+    if ngx_var.server_protocol == "HTTP/1.0" then
+        score = score + 2
+    end
+
     return math.min(score, 6)  -- Cap at 6
 end
 
 -- Rate limiting check
 local function check_rate_limit(ip)
     if not rate_limit_dict then
-        ngx.log(ngx.WARN, "[PoW] Shared dict 'pow_rate_limit' not configured - rate limiting disabled")
+        ngx_log(ngx.WARN, "[PoW] Shared dict 'pow_rate_limit' not configured - rate limiting disabled")
         return true, 0
     end
     
@@ -143,7 +173,7 @@ local function check_rate_limit(ip)
     local count, err = rate_limit_dict:incr(key, 1, 0, 60)  -- 60 second window
     
     if not count then
-        ngx.log(ngx.ERR, "[PoW] Rate limit error: ", err)
+        ngx_log(ngx.ERR, "[PoW] Rate limit error: ", err)
         return true, 0
     end
     
@@ -152,7 +182,7 @@ end
 
 -- Generate challenge string with embedded difficulty (tamper-proof)
 local function generate_challenge(ip, difficulty)
-    local timestamp = ngx.time()
+    local timestamp = ngx_time()
     -- Include difficulty in signature to prevent tampering
     local data = ip .. ":" .. timestamp .. ":" .. difficulty .. ":" .. config.secret
     return signature(data) .. "-" .. timestamp .. "-" .. difficulty
@@ -200,7 +230,7 @@ local function log_challenge(event, ip, data)
     for k, v in pairs(data or {}) do
         msg = msg .. string.format(" %s=%s", k, tostring(v))
     end
-    ngx.log(ngx.INFO, msg)
+    ngx_log(INFO, msg)
 end
 
 -- Main logic is a function that either returns to continue the lua_block in nginx or returns an error response
@@ -212,15 +242,15 @@ function _M.check(custom_difficulty)
 
     -- Main logic
     local remote_addr = get_client_ip()
-    local currenttime = ngx.time()
+    local currenttime = ngx_time()
 
     -- Cookie names (unique per client)
     local cookie_token = "_pow_" .. signature(remote_addr .. "token"):sub(1, 8)
     local cookie_exp = "_pow_" .. signature(remote_addr .. "exp"):sub(1, 8)
 
     -- Check existing valid session
-    local token = ngx.var["cookie_" .. cookie_token] or ""
-    local exp = tonumber(ngx.var["cookie_" .. cookie_exp] or "0")
+    local token = ngx_var["cookie_" .. cookie_token] or ""
+    local exp = tonumber(ngx_var["cookie_" .. cookie_exp] or "0")
     local expected_token = signature(remote_addr .. config.secret .. math.floor(currenttime / config.expire_time))
 
     if token == expected_token and exp > currenttime then
@@ -232,14 +262,14 @@ function _M.check(custom_difficulty)
     if not rate_ok then
         log_challenge("RATE_LIMITED", remote_addr, { count = rate_count, limit = config.rate_limit })
         ngx.status = 429
-        ngx.header["Retry-After"] = "60"
-        ngx.header["Content-Type"] = "text/plain"
-        ngx.say("Too many requests. Please wait a minute.")
-        return ngx.exit(429)
+        ngx_header["Retry-After"] = "60"
+        ngx_header["Content-Type"] = "text/plain"
+        ngx_say("Too many requests. Please wait a minute.")
+        return ngx_exit(429)
     end
 
     -- Handle PoW solution submission
-    local headers = ngx.req.get_headers()
+    local headers = ngx_req.get_headers()
     if headers["x-pow-challenge"] and headers["x-pow-nonce"] then
         local challenge = headers["x-pow-challenge"]
         local nonce = headers["x-pow-nonce"]
@@ -251,16 +281,16 @@ function _M.check(custom_difficulty)
         if not challenge_valid then
             log_challenge("INVALID_CHALLENGE", remote_addr, { challenge = challenge:sub(1, 20) })
             ngx.status = 403
-            ngx.say("Invalid challenge")
-            return ngx.exit(403)
+            ngx_say("Invalid challenge")
+            return ngx_exit(403)
         end
         
         -- Verify timestamp (prevent replay after expiry)
         if currenttime - ts > 300 then  -- 5 minute expiry
             log_challenge("EXPIRED", remote_addr, { age = currenttime - ts })
             ngx.status = 403
-            ngx.say("Challenge expired")
-            return ngx.exit(403)
+            ngx_say("Challenge expired")
+            return ngx_exit(403)
         end
         
         -- Prevent nonce replay (same challenge+nonce can only be used once)
@@ -270,8 +300,8 @@ function _M.check(custom_difficulty)
             if exists then
                 log_challenge("NONCE_REPLAY", remote_addr, { nonce = nonce })
                 ngx.status = 403
-                ngx.say("Nonce already used")
-                return ngx.exit(403)
+                ngx_say("Nonce already used")
+                return ngx_exit(403)
             end
         end
         
@@ -295,17 +325,17 @@ function _M.check(custom_difficulty)
                 hash_prefix = hash:sub(1, 8)
             })
             
-            ngx.header["Set-Cookie"] = {
+            ngx_header["Set-Cookie"] = {
                 cookie_token .. "=" .. new_token .. "; path=/; Max-Age=" .. config.expire_time .. "; SameSite=Lax; HttpOnly",
                 cookie_exp .. "=" .. expire_ts .. "; path=/; Max-Age=" .. config.expire_time .. "; SameSite=Lax"
             }
             ngx.status = 204
-            return ngx.exit(204)
+            return ngx_exit(204)
         else
             log_challenge("INVALID", remote_addr, { nonce = nonce, difficulty = server_difficulty })
             ngx.status = 403
-            ngx.say("Invalid solution")
-            return ngx.exit(403)
+            ngx_say("Invalid solution")
+            return ngx_exit(403)
         end
     end
 
@@ -323,9 +353,10 @@ function _M.check(custom_difficulty)
     })
 
     -- Serve challenge page
-    ngx.status = challenge_status_code
-    ngx.header["Content-Type"] = "text/html; charset=utf-8"
-    ngx.header["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    -- NOTE: Cloudflare uses 403 on their anti-bot page as they found 503 could confuse legitimate clients and some browsers. So that's what we use.
+    ngx.status = 403
+    ngx_header["Content-Type"] = "text/html; charset=utf-8"
+    ngx_header["Cache-Control"] = "no-store, no-cache, must-revalidate"
 
     local html = [[<!DOCTYPE html>
 <html lang="en">
@@ -539,8 +570,8 @@ function _M.check(custom_difficulty)
 </body>
 </html>]]
 
-    ngx.say(html)
-    ngx.exit(challenge_status_code)
+    ngx_say(html)
+    ngx_exit(403)
 end
 
 return _M
