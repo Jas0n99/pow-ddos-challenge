@@ -53,6 +53,9 @@ local config = require("pow_ddos_config")
 -- Shared memory for rate limiting
 local rate_limit_dict = ngx.shared.pow_rate_limit
 
+-- Cloudflare uses 403 on their anti-bot page as they found 503 could confuse legitimate clients and some browsers.
+local challenge_status_code = 403
+
 -- Utility: Generate HMAC signature
 local function signature(str)
     local hash = ngx.encode_base64(ngx.hmac_sha1(config.secret, str))
@@ -320,7 +323,7 @@ function _M.check(custom_difficulty)
     })
 
     -- Serve challenge page
-    ngx.status = 503
+    ngx.status = challenge_status_code
     ngx.header["Content-Type"] = "text/html; charset=utf-8"
     ngx.header["Cache-Control"] = "no-store, no-cache, must-revalidate"
 
@@ -537,7 +540,7 @@ function _M.check(custom_difficulty)
 </html>]]
 
     ngx.say(html)
-    ngx.exit(503)
+    ngx.exit(challenge_status_code)
 end
 
 return _M
