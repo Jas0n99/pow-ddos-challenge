@@ -14,6 +14,12 @@ Instead of complicating the PoW lua script with unnecessary bloat that might not
 
 If you wanted to be truely nefarious for a known bot, you could force the highest level test and if they complete the PoW you can still deliver a 403 afterwards easily within the `access_by_lua_block`.
 
+- Optimized with Nginx internal table shortcuts for better performance
+- Additional server side and client side (JavaScript) suspicion tests
+- Difficulty level 7 "honeypot" - only fake engines trigger this, then get rejected after wasting their time
+- Suspiciously fast solve detection with random jitter and rechallenge (helps prevent against SHA256 acceleration methods)
+- Some very basic minification stripping comments, newlines, and excessive spaces from output
+
 ### Requirements
 - libnginx-mod-http-lua
 - lua-nginx-string
@@ -23,7 +29,6 @@ If you wanted to be truely nefarious for a known bot, you could force the highes
 ```nginx
 http {
     server {
-
         # Apply PoW challenge to all requests (or specific locations)
         access_by_lua_block {
             -- Local shortcuts (micro-optimizations)

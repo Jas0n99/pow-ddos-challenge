@@ -1,48 +1,57 @@
 --[[
+    NOTE: This file gets placed in /etc/nginx/snippets
+
     SHA256 Proof-of-Work Anti-DDoS Challenge
     Cryptographic PoW protection for Nginx/OpenResty
     
+    Originally created by: Andrey Prokopenko
+    https://github.com/terem42/pow-ddos-challenge
+
+    Custom fork by: Jas0n99
+    https://github.com/Jas0n99/pow-ddos-challenge
+
+    Version: 1.0.1
+    Last Updated: 2026-01-05
+
     Security Features:
-    - SHA256 proof-of-work with configurable difficulty (1-6)
+    - SHA256 proof-of-work with configurable difficulty (1-7)
     - HMAC-signed challenges with embedded difficulty (tamper-proof)
     - Server-side bot fingerprinting from HTTP headers
-    - Client-side bot fingerprinting (defense in depth, can only increase difficulty)
+    - Client-side bot fingerprinting (defense in depth, can increase difficulty)
+    - Difficulty level 7 "honeypot" - only fake engines trigger this, then get rejected after wasting their time
     - Nonce replay prevention (each solution valid only once)
     - Challenge expiry (5-minute window)
     - Per-IP rate limiting on challenge requests
     - Secure proxy mode configuration (prevents IP spoofing)
+    - Suspiciously fast solve detection with rechallenge mechanism
     
     Browser Requirements:
     - Web Crypto API (blocks Node.js and simple HTTP clients)
     - ES6 modules (blocks legacy scrapers)
     - JavaScript execution required
     
-    Requirements:
-    - OpenResty with lua-resty-string
-    - Shared memory zone in nginx.conf:
-        lua_shared_dict pow_rate_limit 10m;
-    
-    Usage in nginx.conf:
-        lua_shared_dict pow_rate_limit 10m;
-        access_by_lua_file /path/to/pow_ddos_challenge.lua;
+    Debian/Ubuntu Requirements:
+    - libnginx-mod-http-lua (For basic lua)
+    - lua-nginx-string (For sha256)
+    - Shared memory zone (See sample config 'pow_ddos_challenge.conf')
     
     Challenge Format:
         signature-timestamp-difficulty
         The signature covers IP + timestamp + difficulty + secret, preventing tampering.
     
     Log Events:
-        [PoW] ISSUED           - New challenge generated
-        [PoW] VERIFIED         - Valid solution accepted
-        [PoW] EXPIRED          - Challenge too old (>5 min)
+        [PoW] ISSUED            - New challenge generated
+        [PoW] VERIFIED          - Valid solution accepted
+        [PoW] EXPIRED           - Challenge too old (>5 min)
         [PoW] INVALID_CHALLENGE - Forged/tampered challenge
-        [PoW] INVALID          - Wrong PoW solution
-        [PoW] NONCE_REPLAY     - Attempted nonce reuse
-        [PoW] RATE_LIMITED     - Too many requests from IP
+        [PoW] INVALID           - Wrong PoW solution
+        [PoW] NONCE_REPLAY      - Attempted nonce reuse
+        [PoW] RATE_LIMITED      - Too many requests from IP
+        [PoW] FAKE_ENGINE       - Difficulty 7 trap triggered (bot detected)
+        [PoW] RECHALLENGE       - Solution too fast, issuing new challenge
     
     License: MIT
 ]]
-
--- NOTE: This file gets placed in /etc/nginx/snippets
 
 -- Initialize module
 local _M = {}
@@ -51,10 +60,9 @@ local _M = {}
 local config = require("pow_ddos_config")
 
 -- Shared memory for rate limiting
-local rate_limit_dict = ngx.shared.pow_rate_limit
+local rate_limit_dict = ngx.shared[config.shared_zone]
 
 -- These create "shortcuts" to the Nginx internal tables, which is faster for the LuaJIT compiler to process.
--- local ngx_status = ngx.status --- IGNORE: Does not work correctly ---
 local ngx_var = ngx.var
 local ngx_header = ngx.header
 local ngx_time = ngx.time
@@ -63,8 +71,15 @@ local ngx_say = ngx.say
 local ngx_req = ngx.req
 local ngx_exit = ngx.exit
 local INFO = ngx.INFO
+local WARN = ngx.WARN
+local ERR = ngx.ERR
 local encode_base64 = ngx.encode_base64
 local hmac_sha1 = ngx.hmac_sha1
+local string_rep = string.rep
+local math_floor = math.floor
+local math_max = math.max
+local math_min = math.min
+local tonumber = tonumber
 
 -- Utility: Generate HMAC signature
 local function signature(str)
@@ -89,7 +104,7 @@ local function get_client_ip()
         -- Direct mode: only trust actual remote address
         -- Log warning if forwarded headers are present (potential spoofing attempt)
         if ngx_var.http_x_forwarded_for or ngx_var.http_cf_connecting_ip then
-            ngx_log(ngx.WARN, "[PoW] Forwarded headers present but proxy_mode=direct, ignoring")
+            ngx_log(WARN, "[PoW] Forwarded headers present but proxy_mode=direct, ignoring")
         end
         return ngx_var.remote_addr
     end
@@ -120,12 +135,15 @@ local function detect_server_suspicion()
                or ua:match("bot") or ua:match("Bot") or ua:match("crawler") 
                or ua:match("spider") or ua:match("scraper") then
             score = score + 2
+        elseif ua:match("Linux") and not ua:match("Android") then
+            -- Linux desktop browsers are rare, more often are bots
+            score = score + 1
         end
     else
-        -- Not a string (nil, table, etc) - treat as missing/suspicious
-        score = score + 3
+        -- Not a string (nil, table, etc) - missing UA is very suspicious
+        score = score + 2
 
-        -- Missing User-Agent AND Referer is definitely a bot
+        -- Missing UA and Referer is even more suspicious
         if not headers["referer"] then
             score = score + 2
         end
@@ -134,11 +152,6 @@ local function detect_server_suspicion()
     -- Missing Sec-Fetch headers (modern browsers always send these)
     if not headers["sec-fetch-mode"] and not headers["sec-fetch-site"] then
         -- Could be older browser, minor penalty
-        score = score + 1
-    end
-
-    -- Missing DNT header (most browsers send it)
-    if not headers["dnt"] then
         score = score + 1
     end
 
@@ -159,13 +172,13 @@ local function detect_server_suspicion()
         score = score + 2
     end
 
-    return math.min(score, 6)  -- Cap at 6
+    return math_min(score, 6)  -- Cap at 6
 end
 
 -- Rate limiting check
 local function check_rate_limit(ip)
     if not rate_limit_dict then
-        ngx_log(ngx.WARN, "[PoW] Shared dict 'pow_rate_limit' not configured - rate limiting disabled")
+        ngx_log(WARN, "[PoW] Shared dict 'pow_rate_limit' not configured - rate limiting disabled")
         return true, 0
     end
     
@@ -173,7 +186,7 @@ local function check_rate_limit(ip)
     local count, err = rate_limit_dict:incr(key, 1, 0, 60)  -- 60 second window
     
     if not count then
-        ngx_log(ngx.ERR, "[PoW] Rate limit error: ", err)
+        ngx_log(ERR, "[PoW] Rate limit error: ", err)
         return true, 0
     end
     
@@ -212,6 +225,7 @@ end
 
 -- Verify SHA256 solution (check leading zeros on server)
 local function verify_solution(challenge, nonce, difficulty)
+    -- These locations are possibly different for non-Debian/Ubuntu distros
     local resty_sha256 = require "nginx.sha256"
     local str = require "nginx.string"
     
@@ -220,8 +234,48 @@ local function verify_solution(challenge, nonce, difficulty)
     local digest = sha:final()
     local hex = str.to_hex(digest)
     
-    local target = string.rep("0", difficulty)
+    local target = string_rep("0", difficulty)
     return hex:sub(1, difficulty) == target, hex
+end
+
+-- Count actual leading zeros in hash
+local function count_leading_zeros(hash)
+    local count = 0
+    for i = 1, #hash do
+        if hash:sub(i, i) == "0" then
+            count = count + 1
+        else
+            break
+        end
+    end
+    return count
+end
+
+-- Check if solve time is suspiciously fast for given difficulty, preventing SHA256 acceleration
+local function is_suspiciously_fast(test_difficulty, solve_time_ms)
+    if test_difficulty < 5 then
+        return false  -- Don't check lower difficulties
+    end
+    
+    -- Base thresholds (very conservative - allows 10-100x faster than expected)
+    local thresholds = {
+        [5] = 1000,    -- 1 second (expected ~8s at 135k hash/s)
+        [6] = 10000,   -- 10 seconds (expected ~2min)
+        [7] = 120000   -- 2 minutes (expected ~33min)
+    }
+    
+    local base_threshold = thresholds[test_difficulty]
+    if not base_threshold then
+        return false
+    end
+    
+    -- Add random jitter: ±20%
+    -- This prevents bots from learning exact timing thresholds
+    math.randomseed(ngx_time() + test_difficulty)
+    local jitter = math.random(80, 120) / 100  -- 0.8 to 1.2
+    local threshold = base_threshold * jitter
+    
+    return solve_time_ms < threshold
 end
 
 -- Log challenge metrics
@@ -230,7 +284,8 @@ local function log_challenge(event, ip, data)
     for k, v in pairs(data or {}) do
         msg = msg .. string.format(" %s=%s", k, tostring(v))
     end
-    ngx_log(INFO, msg)
+--    ngx_log(INFO, msg)
+    ngx_log(WARN, msg)
 end
 
 -- Main logic is a function that either returns to continue the lua_block in nginx or returns an error response
@@ -238,7 +293,7 @@ function _M.check(custom_difficulty)
     local pow_difficulty = custom_difficulty or 3
 
     -- Clamp difficulty to safe range (1-6)
-    pow_difficulty = math.max(1, math.min(6, pow_difficulty))
+    pow_difficulty = math_max(1, math_min(6, pow_difficulty))
 
     -- Main logic
     local remote_addr = get_client_ip()
@@ -251,7 +306,7 @@ function _M.check(custom_difficulty)
     -- Check existing valid session
     local token = ngx_var["cookie_" .. cookie_token] or ""
     local exp = tonumber(ngx_var["cookie_" .. cookie_exp] or "0")
-    local expected_token = signature(remote_addr .. config.secret .. math.floor(currenttime / config.expire_time))
+    local expected_token = signature(remote_addr .. config.secret .. math_floor(currenttime / config.expire_time))
 
     if token == expected_token and exp > currenttime then
         return  -- Valid session
@@ -274,6 +329,7 @@ function _M.check(custom_difficulty)
         local challenge = headers["x-pow-challenge"]
         local nonce = headers["x-pow-nonce"]
         local solve_time = tonumber(headers["x-pow-time"]) or 0
+        local client_difficulty = tonumber(headers["x-pow-client-difficulty"]) or 0
         
         -- Verify challenge signature and extract server-signed difficulty
         local challenge_valid, server_difficulty, ts = verify_challenge(challenge, remote_addr)
@@ -309,22 +365,73 @@ function _M.check(custom_difficulty)
         local valid, hash = verify_solution(challenge, nonce, server_difficulty)
         
         if valid then
-            -- Store nonce to prevent replay (TTL = challenge expiry)
+            -- Store nonce to prevent replay attack (TTL = challenge expiry)
             if rate_limit_dict then
                 local nonce_key = "nonce:" .. challenge .. ":" .. nonce
                 rate_limit_dict:set(nonce_key, true, 300)  -- 5 min TTL
             end
+
+            -- Count actual difficulty achieved (for logging and detection)
+            local actual_difficulty = count_leading_zeros(hash)
             
+            -- Default difficulty level for speed test
+            local test_difficulty = server_difficulty
+
+            -- Potential difficulty boost if numbers align
+            if actual_difficulty >= client_difficulty and client_difficulty >= server_difficulty then
+                test_difficulty = client_difficulty
+            end
+
+            -- Check for suspiciously fast high-difficulty solves
+            if is_suspiciously_fast(test_difficulty, solve_time) then
+                log_challenge("RECHALLENGE", remote_addr, {
+                    nonce = nonce,
+                    hash_prefix = hash:sub(1, 8),
+                    solve_time_ms = solve_time,
+                    SD = server_difficulty,
+                    CD = client_difficulty,
+                    AD = actual_difficulty
+                })
+
+                -- Client will reload and get a new challenge
+                -- Note: Nonce is already burned above, so they can't replay this solution
+                ngx.status = 403
+                ngx_say("Verification required")
+                return ngx_exit(403)
+            end
+
+            -- Difficulty 7 honeypot trap: reject if CLIENT intentionally pushed to 7
+            -- This catches fake engines that failed client-side detection tests
+            -- We check both client_difficulty AND actual_difficulty to avoid false positives
+            -- from legitimately lucky solves that happened to get extra zeros
+            if client_difficulty >= 7 and actual_difficulty >= 7 then
+                log_challenge("FAKE_ENGINE", remote_addr, {
+                    nonce = nonce,
+                    hash_prefix = hash:sub(1, 8),
+                    solve_time_ms = solve_time,
+                    SD = server_difficulty,
+                    CD = client_difficulty,
+                    AD = actual_difficulty
+                })
+
+                ngx.status = 403
+                ngx_say("Verification required")
+                return ngx_exit(403)
+            end
+
+            -- Issue new session token
             local expire_ts = currenttime + config.expire_time
-            local new_token = signature(remote_addr .. config.secret .. math.floor(currenttime / config.expire_time))
+            local new_token = signature(remote_addr .. config.secret .. math_floor(currenttime / config.expire_time))
             
             log_challenge("VERIFIED", remote_addr, {
                 nonce = nonce,
-                difficulty = server_difficulty,
+                hash_prefix = hash:sub(1, 8),
                 solve_time_ms = solve_time,
-                hash_prefix = hash:sub(1, 8)
+                SD = server_difficulty,
+                CD = client_difficulty,
+                AD = actual_difficulty
             })
-            
+
             ngx_header["Set-Cookie"] = {
                 cookie_token .. "=" .. new_token .. "; path=/; Max-Age=" .. config.expire_time .. "; SameSite=Lax; HttpOnly",
                 cookie_exp .. "=" .. expire_ts .. "; path=/; Max-Age=" .. config.expire_time .. "; SameSite=Lax"
@@ -341,14 +448,14 @@ function _M.check(custom_difficulty)
 
     -- Calculate difficulty based on server-side detection
     local server_suspicion = detect_server_suspicion()
-    local effective_difficulty = math.min(pow_difficulty + math.floor(server_suspicion / 2), 6)
+    local effective_difficulty = math_min(pow_difficulty + math_floor(server_suspicion / 2), 6)
 
     -- Generate new challenge with embedded difficulty
     local challenge = generate_challenge(remote_addr, effective_difficulty)
     log_challenge("ISSUED", remote_addr, { 
-        base_difficulty = pow_difficulty, 
-        server_suspicion = server_suspicion,
-        effective_difficulty = effective_difficulty,
+        BD = pow_difficulty, 
+        SS = server_suspicion,
+        SD = effective_difficulty,
         rate_count = rate_count 
     })
 
@@ -444,7 +551,43 @@ function _M.check(custom_difficulty)
         const $ = id => document.getElementById(id);
         const status = msg => $('status').textContent = msg;
         const stats = msg => $('stats').textContent = msg;
+
+        // === Bot detection flags ===
+        // These tests run immediately at module load (before detectClientSuspicion is called)
+        // They set flags that detectClientSuspicion() will read to calculate suspicion score
         
+        let failedSemanticTests = false;
+        let failedEventLoopTest = false;
+        
+        // Semantic correctness tests - detect fake JavaScript engines
+        // Real browsers must handle bitwise ops, integer math, and Unicode correctly
+        (function semanticChecks(){
+            let ok = true;
+            
+            // Bitwise shift test - engines must handle 32-bit integers correctly
+            ok = ok && ((1 << 31) === -2147483648);
+            
+            // Integer multiplication test
+            ok = ok && (Math.imul(0xffffffff, 5) === -5);
+            
+            // Unicode surrogate pair handling (emoji is 2 length in JS)
+            ok = ok && (String.fromCodePoint(0x1F600).length === 2);
+            
+            failedSemanticTests = !ok;
+        })();
+        
+        // Event loop ordering test
+        // Real browsers process Promises (microtasks) before setTimeout (macrotasks)
+        await (async function eventLoopTest(){
+            let seq = [];
+            Promise.resolve().then(() => seq.push(1));
+            setTimeout(() => seq.push(2), 0);
+            await new Promise(r => setTimeout(r, 10));
+            
+            // If Promise didn't run first, engine is fake
+            failedEventLoopTest = (seq[0] !== 1);
+        })();
+
         // Parse server-signed minimum difficulty from challenge
         // Format: signature-timestamp-difficulty
         function parseServerDifficulty(challenge) {
@@ -459,42 +602,113 @@ function _M.check(custom_difficulty)
         // NOTE: This can only INCREASE difficulty, never decrease below server minimum
         function detectClientSuspicion() {
             let score = 0;
-            
+            const reasons = [];
+
+            // Engine correctness tests (serious red flags)
+            if (failedSemanticTests) { score += 3; reasons.push(`${score} (Semantic tests)`); }
+            if (failedEventLoopTest) { score += 3; reasons.push(`${score} (Event loop)`); }
+
+            // Browser inconsistency checks (bots often get these wrong)
+            const ua = navigator.userAgent;
+            if (ua.includes('Chrome') && !window.chrome) { score += 1; reasons.push(`${score} (Chrome mismatch)`); }  // Claims Chrome (or Edg) but no chrome object
+            if (ua.includes('Firefox') && typeof InstallTrigger === 'undefined') { score += 1; reasons.push(`${score} (Firefox mismatch)`); }  // Claims Firefox but missing
+            if ( (/\bIntel Mac OS X\b|\bCPU (?:iPhone |iPad )?OS\b/.test(ua)) && ua.includes('Safari') && !/Chrome|Edg|Firefox/.test(ua) && !window.safari ) { score += 1; reasons.push(`${score} (Safari mismatch)`); }  // Claims Safari but missing
+
+            // Real browsers: 20-100+, headless: 0-3
+            // if(navigator.plugins.length < 2) { score += 2; reasons.push(`${score} (Few plugins)`); }
+
+            // Bots fake 1-2 cores, humans 4-16+
+            if(navigator.hardwareConcurrency <= 1) { score += 2; reasons.push(`${score} (Low cores)`); }
+
             // Webdriver flag (Selenium, Puppeteer, Playwright)
-            if (navigator.webdriver === true) score += 3;
+            if (navigator.webdriver === true) { score += 3; reasons.push(`${score} (Webdriver)`); }
             
             // Missing language preferences
-            if (!navigator.languages || navigator.languages.length === 0) score += 2;
-            
+            if (!navigator.languages || navigator.languages.length === 0) { score += 2; reasons.push(`${score} (No languages)`); }
+
+            // Check for automation-specific properties that are hard to hide
+            if (navigator.automation === true) { score += 2; reasons.push(`${score} (Automation)`); }  // New WebDriver BiDi flag
+
             // Known automation frameworks
-            if (window._phantom || window.__nightmare || window.callPhantom) score += 3;
-            if (window.Cypress || window.__puppeteer__) score += 3;
-            if (window.Buffer || window.emit || window.spawn) score += 2;  // Node.js indicators
+            if (window._phantom || window.__nightmare || window.callPhantom) { score += 3; reasons.push(`${score} (Phantom)`); }
+            if (window.Cypress || window.__puppeteer__) { score += 3; reasons.push(`${score} (Cypress/Puppeteer)`); }
+            if (window.Buffer || window.emit || window.spawn) { score += 2; reasons.push(`${score} (Node.js)`); }  // Node.js indicators
             
             // Webdriver attribute on document
-            if (document.documentElement.getAttribute('webdriver') !== null) score += 3;
-            if (document.documentElement.getAttribute('selenium') !== null) score += 3;
+            if (document.documentElement.getAttribute('webdriver') !== null) { score += 3; reasons.push(`${score} (Webdriver attr)`); }
+            if (document.documentElement.getAttribute('selenium') !== null) { score += 3; reasons.push(`${score} (Selenium attr)`); }
             
             // Zero screen dimensions (headless default)
-            if (screen.width === 0 || screen.height === 0) score += 2;
+            if (screen.width === 0 || screen.height === 0) { score += 2; reasons.push(`${score} (Zero screen)`); }
+
+            // Virtual viewport
+            if(window.outerWidth === 0 || screen.availWidth === 0) { score += 2; reasons.push(`${score} (Virtual viewport)`); }
+
+            // Minimal viewport gap
+            if(window.outerHeight - window.innerHeight < 50) { score += 1; reasons.push(`${score} (Minimal gap)`); }
+
+            // No taskbar = Possible VM
+            if(screen.availWidth === screen.width && screen.availHeight === screen.height) { score += 1; reasons.push(`${score} (No taskbar)`); }
             
             // Missing standard browser features
-            if (typeof window.onmousemove === 'undefined' && typeof window.ontouchstart === 'undefined') score += 1;
-            
-            // Permissions API check (often missing in headless)
-            if (!navigator.permissions) score += 1;
+            if (typeof window.onmousemove === 'undefined' && typeof window.ontouchstart === 'undefined') { score += 2; reasons.push(`${score} (No mouse/touch)`); }
+
+            // Permission state (headless + user-denied + missing API)
+            if (navigator.permissions) {
+                navigator.permissions.query({name:'notifications'}).then(result => {
+                    if (result.state === 'denied') { score += 1; reasons.push(`${score} (Notifications Denied)`); }
+                }).catch(() => {});  // Firefox/other browsers
+            } else {
+                score += 1; reasons.push(`${score} (No permissions)`);
+            }
             
             // Media devices (often missing in headless)
-            if (!navigator.mediaDevices) score += 1;
-            
-            return Math.min(score, 6);  // Cap at 6
+            if (!navigator.mediaDevices) { score += 1; reasons.push(`${score} (No media)`); }
+
+            // Notification API (often missing in headless)
+            if (!window.Notification) { score += 1; reasons.push(`${score} (No notifications)`); }
+
+            // Broken Error.stack format (bots often have wrong stack traces)
+            try {
+                null.f();
+            } catch(e) {
+                if (!e.stack || e.stack.split('\n').length < 2) { score += 2; reasons.push(`${score} (Bad stack)`); }
+            }
+
+            // Canvas fingerprinting anomaly
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            ctx.textBaseline = 'top';
+            ctx.font = '14px Arial';
+            ctx.fillText('🤖', 0, 0);
+            const sum = Array.from(ctx.getImageData(0,0,10,10).data).reduce((a,b)=>a+b,0);
+            // const pixels = ctx.getImageData(0, 0, 10, 10).data;
+            // const sum = Array.from(pixels).reduce((a, b) => a + b, 0);
+            if (sum === 0 || sum === 2550) { score += 2; reasons.push(`${score} (Canvas anomaly ${sum})`); }  // Suspiciously uniform
+
+            // WebGL vendor detection (VMs have telltale signatures)
+            const gl = document.createElement('canvas').getContext('webgl');
+            if (gl) {
+                const vendor = gl.getParameter(gl.VENDOR);
+                const renderer = gl.getParameter(gl.RENDERER);
+                // Headless Chrome often uses SwiftShader
+                if (renderer && renderer.includes('SwiftShader')) { score += 4; reasons.push(`${score} (SwiftShader)`); }
+                // VMware/VirtualBox fingerprints
+                if (vendor && (vendor.includes('VMware') || renderer.includes('llvmpipe'))) { score += 4; reasons.push(`${score} (VM detected)`); }
+            }
+
+            // Debug output
+            // console.log('Detection reasons:', reasons);
+
+            // Don't cap - let it go high for extreme bots
+            return score;
         }
         
         // Calculate final difficulty: server minimum + optional client increase
         // Client can only INCREASE difficulty (defense in depth), never decrease
         const clientSuspicion = detectClientSuspicion();
         const clientBonus = Math.floor(clientSuspicion / 2);
-        const DIFFICULTY = Math.min(SERVER_MIN_DIFFICULTY + clientBonus, 6);
+        const DIFFICULTY = Math.min(SERVER_MIN_DIFFICULTY + clientBonus, 7);
         const TARGET = '0'.repeat(DIFFICULTY);
         
         async function sha256(message) {
@@ -505,7 +719,8 @@ function _M.check(custom_difficulty)
         }
         
         async function solve() {
-            status(`Computing proof-of-work (difficulty: ${DIFFICULTY})...`);
+            const diffText = clientBonus > 0 ? `${SERVER_MIN_DIFFICULTY} + ${clientBonus} = ${DIFFICULTY}` : `${DIFFICULTY}`;
+            status(`Computing proof-of-work (Difficulty: ${diffText})...`);
             const startTime = performance.now();
             let nonce = 0;
             let hash = '';
@@ -535,8 +750,9 @@ function _M.check(custom_difficulty)
                 headers: {
                     'X-PoW-Challenge': CHALLENGE,
                     'X-PoW-Nonce': nonce,
-                    'X-PoW-Time': elapsed.toString()
-                    // Note: Difficulty is embedded in signed challenge, not sent as header
+                    'X-PoW-Time': elapsed.toString(),
+                    'X-PoW-Client-Difficulty': DIFFICULTY.toString()
+                    // Note: Difficulty is embedded in signed challenge, header is for logging comparison only
                     // Server extracts and verifies difficulty from challenge signature
                 }
             });
@@ -569,6 +785,12 @@ function _M.check(custom_difficulty)
     </script>
 </body>
 </html>]]
+
+    -- Some very basic minification stripping comments, newlines, and excessive spaces
+    html = html:gsub("([^:])//[^\n]*", "%1")
+    html = html:gsub("\n+", " ")
+    html = html:gsub("  +", " ")
+    html = html:gsub(">%s+<", "><")
 
     ngx_say(html)
     ngx_exit(403)
