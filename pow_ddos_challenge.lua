@@ -10,20 +10,23 @@
     Custom fork by: Jas0n99
     https://github.com/Jas0n99/pow-ddos-challenge
 
-    Version: 1.0.1
-    Last Updated: 2026-01-05
+    Version: 1.1.0
+    Last Updated: 2026-01-10
 
     Security Features:
     - SHA256 proof-of-work with configurable difficulty (1-7)
     - HMAC-signed challenges with embedded difficulty (tamper-proof)
     - Server-side bot fingerprinting from HTTP headers
     - Client-side bot fingerprinting (defense in depth, can increase difficulty)
-    - Difficulty level 7 "honeypot" - only fake engines trigger this, then get rejected after wasting their time
+    - Two-phase challenge: client suspicion score calculated and sent back first before recieving final difficulty and challenge
+    - Enforced JavaScript timing delay with server-side verification / penalty
+    - Difficulty 7 "honeypot" - only fake engines trigger this, then get rejected after wasting their time
     - Nonce replay prevention (each solution valid only once)
     - Challenge expiry (5-minute window)
     - Per-IP rate limiting on challenge requests
     - Secure proxy mode configuration (prevents IP spoofing)
     - Suspiciously fast solve detection with rechallenge mechanism
+    - ACME challenge bypass for SSL certificate renewal
     
     Browser Requirements:
     - Web Crypto API (blocks Node.js and simple HTTP clients)
@@ -49,6 +52,7 @@
         [PoW] RATE_LIMITED      - Too many requests from IP
         [PoW] FAKE_ENGINE       - Difficulty 7 trap triggered (bot detected)
         [PoW] RECHALLENGE       - Solution too fast, issuing new challenge
+        [PoW] TIMING_VIOLATION  - Client suspicion score submitted too quickly
     
     License: MIT
 ]]
@@ -65,7 +69,8 @@ local rate_limit_dict = ngx.shared[config.shared_zone]
 -- These create "shortcuts" to the Nginx internal tables, which is faster for the LuaJIT compiler to process.
 local ngx_var = ngx.var
 local ngx_header = ngx.header
-local ngx_time = ngx.time
+local ngx_time = ngx.time   -- UNIX timestamp (integer)
+local ngx_now = ngx.now     -- UNIX timestamp (float)
 local ngx_log = ngx.log
 local ngx_say = ngx.say
 local ngx_req = ngx.req
@@ -111,8 +116,7 @@ local function get_client_ip()
 end
 
 -- Server-side bot detection from HTTP headers
-local function detect_server_suspicion()
-    local headers = ngx_req.get_headers()
+local function detect_server_suspicion(headers)
     local score = 0
     
     -- Missing Accept-Language (all real browsers send this)
@@ -176,51 +180,57 @@ local function detect_server_suspicion()
 end
 
 -- Rate limiting check
-local function check_rate_limit(ip)
-    if not rate_limit_dict then
-        ngx_log(WARN, "[PoW] Shared dict 'pow_rate_limit' not configured - rate limiting disabled")
-        return true, 0
-    end
-    
-    local key = "pow:" .. ip
-    local count, err = rate_limit_dict:incr(key, 1, 0, 60)  -- 60 second window
+local function check_rate_limit(remote_addr)
+    local key = "pow:" .. remote_addr
+    local count, err = rate_limit_dict:incr(key, 1, 0, 60)  -- 60 second window, does not update TTL on existing key
     
     if not count then
         ngx_log(ERR, "[PoW] Rate limit error: ", err)
-        return true, 0
+        return 0  -- On error, don't block them (fail open)
     end
     
-    return count <= config.rate_limit, count
+    if count > config.rate_limit then
+        log_challenge("RATE_LIMITED", remote_addr, {
+            rate_count = count,
+            rate_limit = config.rate_limit
+        })
+        ngx.status = 429
+        ngx_header["Retry-After"] = "60"
+        ngx_header["Content-Type"] = "text/plain"
+        ngx_say("Too many requests. Please wait a minute.")
+        return ngx_exit(429)
+    end
+    
+    return count  -- Return count for logging
 end
 
 -- Generate challenge string with embedded difficulty (tamper-proof)
-local function generate_challenge(ip, difficulty)
-    local timestamp = ngx_time()
-    -- Include difficulty in signature to prevent tampering
-    local data = ip .. ":" .. timestamp .. ":" .. difficulty .. ":" .. config.secret
-    return signature(data) .. "-" .. timestamp .. "-" .. difficulty
+local function generate_challenge(remote_addr, host, difficulty, current_time)
+    -- Include host and difficulty in signature to prevent tampering and cross site reuse
+    local data = remote_addr .. ":" .. host .. ":" .. current_time .. ":" .. difficulty .. ":" .. config.secret
+    return signature(data) .. "-" .. current_time .. "-" .. difficulty
 end
 
 -- Verify challenge signature and extract difficulty
 -- Returns: is_valid, extracted_difficulty, timestamp
-local function verify_challenge(challenge, ip)
-    local sig, ts, diff = challenge:match("^(.+)-(%d+)-(%d+)$")
-    if not sig or not ts or not diff then
+local function verify_challenge(challenge, remote_addr, host)
+    local sig, tstamp, difficulty = challenge:match("^(.+)-(%d+)-(%d+)$")
+    if not sig or not tstamp or not difficulty then
         return false, nil, nil
     end
     
-    ts = tonumber(ts)
-    diff = tonumber(diff)
+    tstamp = tonumber(tstamp)
+    difficulty = tonumber(difficulty)
     
     -- Recreate expected signature
-    local data = ip .. ":" .. ts .. ":" .. diff .. ":" .. config.secret
+    local data = remote_addr .. ":" .. host .. ":" .. tstamp .. ":" .. difficulty .. ":" .. config.secret
     local expected_sig = signature(data)
     
     if sig ~= expected_sig then
         return false, nil, nil
     end
     
-    return true, diff, ts
+    return true, difficulty, tstamp
 end
 
 -- Verify SHA256 solution (check leading zeros on server)
@@ -238,22 +248,9 @@ local function verify_solution(challenge, nonce, difficulty)
     return hex:sub(1, difficulty) == target, hex
 end
 
--- Count actual leading zeros in hash
-local function count_leading_zeros(hash)
-    local count = 0
-    for i = 1, #hash do
-        if hash:sub(i, i) == "0" then
-            count = count + 1
-        else
-            break
-        end
-    end
-    return count
-end
-
 -- Check if solve time is suspiciously fast for given difficulty, preventing SHA256 acceleration
 local function is_suspiciously_fast(test_difficulty, solve_time_ms)
-    if test_difficulty < 5 then
+    if test_difficulty < 6 then
         return false  -- Don't check lower difficulties
     end
     
@@ -279,8 +276,8 @@ local function is_suspiciously_fast(test_difficulty, solve_time_ms)
 end
 
 -- Log challenge metrics
-local function log_challenge(event, ip, data)
-    local msg = string.format("[PoW] %s ip=%s", event, ip)
+local function log_challenge(event, remote_addr, data)
+    local msg = string.format("[PoW] %s remote_addr=%s", event, remote_addr)
     for k, v in pairs(data or {}) do
         msg = msg .. string.format(" %s=%s", k, tostring(v))
     end
@@ -290,107 +287,99 @@ end
 
 -- Main logic is a function that either returns to continue the lua_block in nginx or returns an error response
 function _M.check(custom_difficulty)
-    local pow_difficulty = custom_difficulty or 3
+    -- ACME Challenge Bypass - Always allow Let's Encrypt certificate renewal
+    if ngx_var.uri:match("^/.well%-known/acme%-challenge/") then
+        return
+    end
 
-    -- Clamp difficulty to safe range (1-6)
-    pow_difficulty = math_max(1, math_min(6, pow_difficulty))
+    -- Require the shared dict due to numerous dependencies
+    if not rate_limit_dict then
+        ngx_log(WARN, "[PoW] CRITICAL: Shared dict 'pow_rate_limit' not configured!")
+        return ngx_exit(500)
+    end
 
-    -- Main logic
+    -- Start Main Logic
+    local pow_difficulty = math_max(1, math_min(6, custom_difficulty or 3))  -- Clamp configured difficulty to safe range (1-6)
     local remote_addr = get_client_ip()
-    local currenttime = ngx_time()
+    local current_time = ngx_time()
+    local time_bucket = math_floor(tonumber(current_time) / tonumber(config.expire_time))
+    local host = ngx_var.host
 
-    -- Cookie names (unique per client)
-    local cookie_token = "_pow_" .. signature(remote_addr .. "token"):sub(1, 8)
-    local cookie_exp = "_pow_" .. signature(remote_addr .. "exp"):sub(1, 8)
-
-    -- Check existing valid session
+    -- Cookie check (unique per client, per hostname)
+    -- Removed cookie_exp, the token is either valid within the time bucket, or it's not.
+    local cookie_token = "_pow_" .. signature(remote_addr .. host .. "token"):sub(1, 8)
     local token = ngx_var["cookie_" .. cookie_token] or ""
-    local exp = tonumber(ngx_var["cookie_" .. cookie_exp] or "0")
-    local expected_token = signature(remote_addr .. config.secret .. math_floor(currenttime / config.expire_time))
-
-    if token == expected_token and exp > currenttime then
-        return  -- Valid session
+    local expected_token = signature(remote_addr .. host .. config.secret .. time_bucket)
+    if token == expected_token then
+        return  -- Valid session, allow request
     end
 
-    -- Rate limiting check
-    local rate_ok, rate_count = check_rate_limit(remote_addr)
-    if not rate_ok then
-        log_challenge("RATE_LIMITED", remote_addr, { count = rate_count, limit = config.rate_limit })
-        ngx.status = 429
-        ngx_header["Retry-After"] = "60"
-        ngx_header["Content-Type"] = "text/plain"
-        ngx_say("Too many requests. Please wait a minute.")
-        return ngx_exit(429)
-    end
-
-    -- Handle PoW solution submission
+    -- 3 Phase test below: Greet, Challenge, Verify
     local headers = ngx_req.get_headers()
+
+    -- Phase 3: Check for PoW solution submission
     if headers["x-pow-challenge"] and headers["x-pow-nonce"] then
+        -- Phase 3: Receive and verify PoW solution
         local challenge = headers["x-pow-challenge"]
         local nonce = headers["x-pow-nonce"]
-        local solve_time = tonumber(headers["x-pow-time"]) or 0
-        local client_difficulty = tonumber(headers["x-pow-client-difficulty"]) or 0
-        
+        local solve_time = tonumber(headers["x-pow-time"]) or 0  -- Client processing time, just used for logging
+
+        -- Rate limiting check
+        local rate_count = check_rate_limit(remote_addr)
+
         -- Verify challenge signature and extract server-signed difficulty
-        local challenge_valid, server_difficulty, ts = verify_challenge(challenge, remote_addr)
+        local challenge_valid, server_difficulty, tstamp = verify_challenge(challenge, remote_addr, host)
         
         if not challenge_valid then
-            log_challenge("INVALID_CHALLENGE", remote_addr, { challenge = challenge:sub(1, 20) })
+            log_challenge("INVALID_CHALLENGE", remote_addr, {
+                challenge = challenge:sub(1, 20),
+                rate_count = rate_count
+            })
             ngx.status = 403
             ngx_say("Invalid challenge")
             return ngx_exit(403)
         end
         
         -- Verify timestamp (prevent replay after expiry)
-        if currenttime - ts > 300 then  -- 5 minute expiry
-            log_challenge("EXPIRED", remote_addr, { age = currenttime - ts })
+        if current_time - tstamp > 300 then  -- 5 minute expiry
+            log_challenge("EXPIRED", remote_addr, {
+                age = current_time - tstamp,
+                rate_count = rate_count
+            })
             ngx.status = 403
             ngx_say("Challenge expired")
             return ngx_exit(403)
         end
         
-        -- Prevent nonce replay (same challenge+nonce can only be used once)
-        if rate_limit_dict then
-            local nonce_key = "nonce:" .. challenge .. ":" .. nonce
-            local exists = rate_limit_dict:get(nonce_key)
-            if exists then
-                log_challenge("NONCE_REPLAY", remote_addr, { nonce = nonce })
-                ngx.status = 403
-                ngx_say("Nonce already used")
-                return ngx_exit(403)
-            end
+        -- Check dict to prevent nonce replay (same challenge+nonce can only be used once)
+        local nonce_key = "nonce:" .. challenge .. ":" .. nonce
+        local exists = rate_limit_dict:get(nonce_key)
+        if exists then
+            log_challenge("NONCE_REPLAY", remote_addr, {
+                nonce = nonce,
+                rate_count = rate_count
+            })
+            ngx.status = 403
+            ngx_say("Nonce already used")
+            return ngx_exit(403)
         end
         
-        -- Verify PoW solution with SERVER-SIGNED difficulty (not client-supplied!)
+        -- Verify PoW solution with SERVER-SIGNED difficulty
         local valid, hash = verify_solution(challenge, nonce, server_difficulty)
         
         if valid then
             -- Store nonce to prevent replay attack (TTL = challenge expiry)
-            if rate_limit_dict then
-                local nonce_key = "nonce:" .. challenge .. ":" .. nonce
-                rate_limit_dict:set(nonce_key, true, 300)  -- 5 min TTL
-            end
-
-            -- Count actual difficulty achieved (for logging and detection)
-            local actual_difficulty = count_leading_zeros(hash)
-            
-            -- Default difficulty level for speed test
-            local test_difficulty = server_difficulty
-
-            -- Potential difficulty boost if numbers align
-            if actual_difficulty >= client_difficulty and client_difficulty >= server_difficulty then
-                test_difficulty = client_difficulty
-            end
+            local nonce_key = "nonce:" .. challenge .. ":" .. nonce
+            rate_limit_dict:set(nonce_key, true, 300)  -- 5 min TTL
 
             -- Check for suspiciously fast high-difficulty solves
-            if is_suspiciously_fast(test_difficulty, solve_time) then
+            if is_suspiciously_fast(server_difficulty, solve_time) then
                 log_challenge("RECHALLENGE", remote_addr, {
                     nonce = nonce,
                     hash_prefix = hash:sub(1, 8),
                     solve_time_ms = solve_time,
-                    SD = server_difficulty,
-                    CD = client_difficulty,
-                    AD = actual_difficulty
+                    server_difficulty = server_difficulty,
+                    rate_count = rate_count
                 })
 
                 -- Client will reload and get a new challenge
@@ -402,70 +391,111 @@ function _M.check(custom_difficulty)
 
             -- Difficulty 7 honeypot trap: reject if CLIENT intentionally pushed to 7
             -- This catches fake engines that failed client-side detection tests
-            -- We check both client_difficulty AND actual_difficulty to avoid false positives
-            -- from legitimately lucky solves that happened to get extra zeros
-            if client_difficulty >= 7 and actual_difficulty >= 7 then
+            if server_difficulty >= 7 then
                 log_challenge("FAKE_ENGINE", remote_addr, {
                     nonce = nonce,
                     hash_prefix = hash:sub(1, 8),
                     solve_time_ms = solve_time,
-                    SD = server_difficulty,
-                    CD = client_difficulty,
-                    AD = actual_difficulty
+                    server_difficulty = server_difficulty,
+                    rate_count = rate_count
                 })
-
                 ngx.status = 403
                 ngx_say("Verification required")
                 return ngx_exit(403)
             end
 
             -- Issue new session token
-            local expire_ts = currenttime + config.expire_time
-            local new_token = signature(remote_addr .. config.secret .. math_floor(currenttime / config.expire_time))
+            local expire_ts = current_time + config.expire_time
+            local new_token = signature(remote_addr .. host .. config.secret .. time_bucket)
             
             log_challenge("VERIFIED", remote_addr, {
                 nonce = nonce,
                 hash_prefix = hash:sub(1, 8),
                 solve_time_ms = solve_time,
-                SD = server_difficulty,
-                CD = client_difficulty,
-                AD = actual_difficulty
+                server_difficulty = server_difficulty,
+                rate_count = rate_count
             })
 
             ngx_header["Set-Cookie"] = {
                 cookie_token .. "=" .. new_token .. "; path=/; Max-Age=" .. config.expire_time .. "; SameSite=Lax; HttpOnly",
-                cookie_exp .. "=" .. expire_ts .. "; path=/; Max-Age=" .. config.expire_time .. "; SameSite=Lax"
             }
             ngx.status = 204
             return ngx_exit(204)
         else
-            log_challenge("INVALID", remote_addr, { nonce = nonce, difficulty = server_difficulty })
+            log_challenge("INVALID", remote_addr, {
+                nonce = nonce,
+                difficulty = server_difficulty,
+                rate_count = rate_count
+            })
             ngx.status = 403
             ngx_say("Invalid solution")
             return ngx_exit(403)
         end
-    end
+    elseif headers["x-pow-client-suspicion"] then
+        -- Phase 2: Receive client suspicion score and send back PoW challenge
+        local client_suspicion = tonumber(headers["x-pow-client-suspicion"]) or 0
+        client_suspicion = math_max(0, math_min(client_suspicion, 14))
 
-    -- Calculate difficulty based on server-side detection
-    local server_suspicion = detect_server_suspicion()
-    local effective_difficulty = math_min(pow_difficulty + math_floor(server_suspicion / 2), 6)
+        -- Rate limiting check
+        local rate_count = check_rate_limit(remote_addr)
 
-    -- Generate new challenge with embedded difficulty
-    local challenge = generate_challenge(remote_addr, effective_difficulty)
-    log_challenge("ISSUED", remote_addr, { 
-        BD = pow_difficulty, 
-        SS = server_suspicion,
-        SD = effective_difficulty,
-        rate_count = rate_count 
-    })
+        -- Verify client timing (prevent immediate replies)
+        local ts_key = "pow_ts:" .. remote_addr
+        local ts_start = rate_limit_dict:get(ts_key)
 
-    -- Serve challenge page
-    -- NOTE: Cloudflare uses 403 on their anti-bot page as they found 503 could confuse legitimate clients and some browsers. So that's what we use.
-    ngx.status = 403
-    ngx_header["Content-Type"] = "text/html; charset=utf-8"
-    ngx_header["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        if ts_start then
+            local ts_elapsed = ngx_now() - ts_start
+            if ts_elapsed < 2 then
+                -- Penalize by adding to their suspicion score
+                log_challenge("TIMING_VIOLATION", remote_addr, {
+                    ts_elapsed = ts_elapsed,
+                    client_suspicion = client_suspicion,
+                    rate_count = rate_count
+                })
+                client_suspicion = client_suspicion + 2
+            end
+        else
+            -- Challenge expired or never started
+            log_challenge("EXPIRED", remote_addr, {
+                reason = "no start timestamp",
+                rate_count = rate_count
+            })
+            ngx.status = 403
+            ngx_say("Challenge expired")
+            return ngx_exit(403)
+        end
 
-    local html = [[<!DOCTYPE html>
+        -- Calculate difficulty based on server-side detection
+        local server_suspicion = detect_server_suspicion(headers)
+        local effective_difficulty = math_min(pow_difficulty + math_floor(server_suspicion + client_suspicion / 2), 7)
+
+        -- Generate new challenge with embedded difficulty
+        local challenge = generate_challenge(remote_addr, host, effective_difficulty, current_time)
+        log_challenge("ISSUED", remote_addr, { 
+            base_difficulty = pow_difficulty, 
+            server_suspicion = server_suspicion,
+            client_suspicion = client_suspicion,
+            effective_difficulty = effective_difficulty,
+            rate_count = rate_count
+        })
+
+        ngx.status = 204
+        ngx_header["X-PoW-Challenge"] = challenge
+        ngx_exit(204)
+    else
+        -- Phase 1: Initial request - Greet with challenge page
+
+        -- Generate initial low TTL simple session token for tracking reply timing
+        rate_limit_dict:set("pow_ts:" .. remote_addr, ngx_now(), 15)  -- reset TTL each new challenge
+
+        -- NOTE: Cloudflare uses 403 on their anti-bot page as they found 503 could confuse legitimate clients and some browsers. So that's what we use.
+        -- Comments in JavaScript will get stripped out before sending to the browser.
+        -- Maybe eventually move HTML to separate file and use ngx.exec() since it is all static now?
+        ngx.status = 403
+        ngx_header["Content-Type"] = "text/html; charset=utf-8"
+        ngx_header["Cache-Control"] = "no-store, no-cache, must-revalidate"
+
+        local html = [[<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -546,19 +576,62 @@ function _M.check(custom_difficulty)
     </div>
 
     <script type="module">
-        const CHALLENGE = ']] .. challenge .. [[';
-        
+        const quotes = ["I'm gonna make him an offer he can't refuse.", "I coulda had class. I coulda been a contender.", "I am one with the Force, and the Force is with me.",
+            "Here's looking at you, kid.", "Go ahead, make my day.", "May the Force be with you.", "You talking to me?", "Fasten your seatbelts.", "I'll be back.", "Here's Johnny!",
+            "What we've got here is failure to communicate.", "Never tell me the odds!", "Made it, Ma! Top of the world!", "A census taker once tried to test me.",
+            "Bond. James Bond.", "There's no place like home.", "Show me the money!", "I'm walking here! I'm walking here!", "You can't handle the truth!", "I want to be alone.",
+            "I'll have what she's having.", "Round up the usual suspects.", "You're gonna need a bigger boat.", "Badges? We ain't got no badges!", "If you build it, he will come.",
+            "We'll always have Paris.", "Stella! Hey, Stella!", "Well, nobody's perfect.", "It's alive! It's alive!", "Houston, we have a problem.", "There's no crying in baseball!",
+            "Say hello to my little friend!", "What a dump.", "Elementary, my dear Watson.", "The cake is a lie.", "Is it safe?", "Wait a minute, wait a minute.",
+            "Soylent Green is people!", "Open the pod bay doors, HAL.", "Toga! Toga!", "My precious.", "Who's on first.", "I feel the need, the need for speed!", "Hello there.",
+            "Snap out of it!", "Do or do not. There is no try.", "They're here!", "I'm the king of the world!", "It's a trap!", "I don't think he knows about second breakfast, pip."];
+
+        // Challenge will be received from server after suspicion score submission
         const $ = id => document.getElementById(id);
         const status = msg => $('status').textContent = msg;
         const stats = msg => $('stats').textContent = msg;
 
+        // Mouse movement tracking
+        let mouseMovements = 0;
+        let lastMouseTime = 0;
+        let mouseVelocities = [];
+        let mouseTeleports = 0;  // Detect instant jumps
+
+        // Track mouse/touch during page load
+        document.addEventListener('mousemove', (e) => {
+            mouseMovements++;
+            const now = performance.now();
+            
+            // Calculate velocity
+            if (lastMouseTime > 0) {
+                const timeDelta = now - lastMouseTime;
+                if (timeDelta > 0) {
+                    const distance = Math.sqrt(e.movementX**2 + e.movementY**2);
+                    const velocity = distance / timeDelta;
+                    mouseVelocities.push(velocity);
+                    
+                    // Detect teleports (>500px instant jump is suspicious)
+                    if (distance > 500 && timeDelta < 16) {
+                        mouseTeleports++;
+                        // console.log('Teleport detected!', { distance, timeDelta });
+                    }
+                }
+            }
+            lastMouseTime = now;
+        });
+
+        // Track touch for mobile devices
+        document.addEventListener('touchmove', () => {
+            mouseMovements++;  // Count touch as movement
+        });
+
         // === Bot detection flags ===
         // These tests run immediately at module load (before detectClientSuspicion is called)
         // They set flags that detectClientSuspicion() will read to calculate suspicion score
-        
+
         let failedSemanticTests = false;
         let failedEventLoopTest = false;
-        
+
         // Semantic correctness tests - detect fake JavaScript engines
         // Real browsers must handle bitwise ops, integer math, and Unicode correctly
         (function semanticChecks(){
@@ -588,16 +661,6 @@ function _M.check(custom_difficulty)
             failedEventLoopTest = (seq[0] !== 1);
         })();
 
-        // Parse server-signed minimum difficulty from challenge
-        // Format: signature-timestamp-difficulty
-        function parseServerDifficulty(challenge) {
-            const parts = challenge.split('-');
-            const diff = parseInt(parts[parts.length - 1], 10);
-            return isNaN(diff) ? 3 : Math.max(1, Math.min(6, diff));
-        }
-        
-        const SERVER_MIN_DIFFICULTY = parseServerDifficulty(CHALLENGE);
-        
         // Cross-browser bot fingerprinting (defense in depth)
         // NOTE: This can only INCREASE difficulty, never decrease below server minimum
         function detectClientSuspicion() {
@@ -614,20 +677,14 @@ function _M.check(custom_difficulty)
             if (ua.includes('Firefox') && typeof InstallTrigger === 'undefined') { score += 1; reasons.push(`${score} (Firefox mismatch)`); }  // Claims Firefox but missing
             if ( (/\bIntel Mac OS X\b|\bCPU (?:iPhone |iPad )?OS\b/.test(ua)) && ua.includes('Safari') && !/Chrome|Edg|Firefox/.test(ua) && !window.safari ) { score += 1; reasons.push(`${score} (Safari mismatch)`); }  // Claims Safari but missing
 
-            // Real browsers: 20-100+, headless: 0-3
-            // if(navigator.plugins.length < 2) { score += 2; reasons.push(`${score} (Few plugins)`); }
-
             // Bots fake 1-2 cores, humans 4-16+
-            if(navigator.hardwareConcurrency <= 1) { score += 2; reasons.push(`${score} (Low cores)`); }
+            if(navigator.hardwareConcurrency <= 2) { score += 2; reasons.push(`${score} (Low cores)`); }
 
             // Webdriver flag (Selenium, Puppeteer, Playwright)
             if (navigator.webdriver === true) { score += 3; reasons.push(`${score} (Webdriver)`); }
             
             // Missing language preferences
             if (!navigator.languages || navigator.languages.length === 0) { score += 2; reasons.push(`${score} (No languages)`); }
-
-            // Check for automation-specific properties that are hard to hide
-            if (navigator.automation === true) { score += 2; reasons.push(`${score} (Automation)`); }  // New WebDriver BiDi flag
 
             // Known automation frameworks
             if (window._phantom || window.__nightmare || window.callPhantom) { score += 3; reasons.push(`${score} (Phantom)`); }
@@ -644,22 +701,23 @@ function _M.check(custom_difficulty)
             // Virtual viewport
             if(window.outerWidth === 0 || screen.availWidth === 0) { score += 2; reasons.push(`${score} (Virtual viewport)`); }
 
-            // Minimal viewport gap
-            if(window.outerHeight - window.innerHeight < 50) { score += 1; reasons.push(`${score} (Minimal gap)`); }
-
-            // No taskbar = Possible VM
-            if(screen.availWidth === screen.width && screen.availHeight === screen.height) { score += 1; reasons.push(`${score} (No taskbar)`); }
-            
             // Missing standard browser features
             if (typeof window.onmousemove === 'undefined' && typeof window.ontouchstart === 'undefined') { score += 2; reasons.push(`${score} (No mouse/touch)`); }
 
-            // Permission state (headless + user-denied + missing API)
-            if (navigator.permissions) {
-                navigator.permissions.query({name:'notifications'}).then(result => {
-                    if (result.state === 'denied') { score += 1; reasons.push(`${score} (Notifications Denied)`); }
-                }).catch(() => {});  // Firefox/other browsers
+            // Permission state (headless + missing API)
+            // intentionally ignore "denied"
+            if (navigator.permissions && navigator.permissions.query) {
+                navigator.permissions
+                    .query({ name: 'notifications' })
+                    .then(result => {
+                        if (!result || !result.state) { score += 1; reasons.push(`${score} (Permissions query returned nothing)`); }
+                    })
+                    .catch(() => {
+                        reasons.push(`${score} (Permissions query failed)`);  // Firefox/other browsers
+                    });
             } else {
-                score += 1; reasons.push(`${score} (No permissions)`);
+                score += 1;
+                reasons.push(`${score} (Permissions API missing)`);
             }
             
             // Media devices (often missing in headless)
@@ -697,43 +755,65 @@ function _M.check(custom_difficulty)
                 if (vendor && (vendor.includes('VMware') || renderer.includes('llvmpipe'))) { score += 4; reasons.push(`${score} (VM detected)`); }
             }
 
+            // Mouse/touch interaction checks (only penalize suspicious patterns, not absence)
+            // console.log('Mouse tracking:', { movements: mouseMovements, velocities: mouseVelocities.length, teleports: mouseTeleports });
+            // Check for robotic/scripted mouse patterns (only if there WAS movement)
+            if (mouseVelocities.length > 10) {
+                const avgVelocity = mouseVelocities.reduce((a,b) => a+b, 0) / mouseVelocities.length;
+                const variance = mouseVelocities.reduce((sum, v) => sum + Math.pow(v - avgVelocity, 2), 0) / mouseVelocities.length;
+                // console.log('Mouse variance analysis:', { avgVelocity: avgVelocity.toFixed(4), variance: variance.toFixed(6), threshold: 0.00001 });
+                // Real humans have high variance (natural jitter), bots are too smooth
+                if (variance < 0.00001) { score += 2; reasons.push(`${score} (Robotic mouse, variance: ${variance.toFixed(4)})`); }
+            }
+            
+            // Teleporting mouse (instant jumps - clear bot indicator)
+            if (mouseTeleports > 2) { score += 2; reasons.push(`${score} (Mouse teleports: ${mouseTeleports})`); }
+
             // Debug output
             // console.log('Detection reasons:', reasons);
+            // document.body.innerHTML += `<pre>${JSON.stringify(reasons)}</pre>`;
 
             // Don't cap - let it go high for extreme bots
             return score;
         }
-        
-        // Calculate final difficulty: server minimum + optional client increase
-        // Client can only INCREASE difficulty (defense in depth), never decrease
-        const clientSuspicion = detectClientSuspicion();
-        const clientBonus = Math.floor(clientSuspicion / 2);
-        const DIFFICULTY = Math.min(SERVER_MIN_DIFFICULTY + clientBonus, 7);
-        const TARGET = '0'.repeat(DIFFICULTY);
-        
+
+        // Parse server-signed minimum difficulty from challenge
+        // Format: signature-timestamp-difficulty
+        function parseServerDifficulty(challenge) {
+            const parts = challenge.split('-');
+            const diff = parseInt(parts[parts.length - 1], 10);
+            return isNaN(diff) ? 3 : Math.max(1, Math.min(7, diff));
+        }
+
         async function sha256(message) {
             const msgBuffer = new TextEncoder().encode(message);
             const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
             const hashArray = Array.from(new Uint8Array(hashBuffer));
             return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
         }
-        
-        async function solve() {
-            const diffText = clientBonus > 0 ? `${SERVER_MIN_DIFFICULTY} + ${clientBonus} = ${DIFFICULTY}` : `${DIFFICULTY}`;
-            status(`Computing proof-of-work (Difficulty: ${diffText})...`);
+
+        // Final difficulty will be determined by server after client suspicion score submission        
+        async function solve(challenge) {
+            const DIFFICULTY = parseServerDifficulty(challenge);
+            const TARGET = '0'.repeat(DIFFICULTY);
+            status(`Computing proof-of-work (Difficulty: ${DIFFICULTY})...`);
+
             const startTime = performance.now();
             let nonce = 0;
             let hash = '';
-            
             const CHUNK_SIZE = 5000;
-            
+
+            // Just for fun...
+            const quoteTimer = setInterval(() => { status(quotes[Math.floor(Math.random() * quotes.length)]); }, 5000);
+
             while (true) {
                 for (let i = 0; i < CHUNK_SIZE; i++) {
-                    hash = await sha256(CHALLENGE + nonce);
+                    hash = await sha256(challenge + nonce);
                     if (hash.startsWith(TARGET)) {
+                        clearInterval(quoteTimer);
                         const elapsed = performance.now() - startTime;
                         stats(`${nonce.toLocaleString()} hashes in ${(elapsed/1000).toFixed(2)}s`);
-                        return { nonce: nonce.toString(), hash, elapsed: Math.round(elapsed) };
+                        return { nonce: nonce.toString(), elapsed: Math.round(elapsed) };
                     }
                     nonce++;
                 }
@@ -741,59 +821,91 @@ function _M.check(custom_difficulty)
                 await new Promise(r => setTimeout(r, 0));
             }
         }
-        
-        async function submit(nonce, elapsed) {
+
+        // Send the PoW solution back to the server for verification        
+        async function submit(challenge, nonce, elapsed) {
             status('Verifying...');
             const res = await fetch(location.href, {
                 method: 'POST',
                 credentials: 'include',
                 headers: {
-                    'X-PoW-Challenge': CHALLENGE,
+                    'X-PoW-Challenge': challenge,
                     'X-PoW-Nonce': nonce,
-                    'X-PoW-Time': elapsed.toString(),
-                    'X-PoW-Client-Difficulty': DIFFICULTY.toString()
-                    // Note: Difficulty is embedded in signed challenge, header is for logging comparison only
-                    // Server extracts and verifies difficulty from challenge signature
+                    'X-PoW-Time': elapsed.toString()
                 }
             });
             
             if (res.status === 204 || res.ok) {
                 status('Verified! Redirecting...');
                 document.querySelector('.spinner-box').classList.add('success');
-                setTimeout(() => location.reload(), 600);
+                setTimeout(() => location.reload(), 1000);
             } else if (res.status === 429) {
                 status('Too many attempts. Please wait...');
                 setTimeout(() => location.reload(), 60000);
             } else {
                 status('Verification failed. Retrying...');
-                setTimeout(() => location.reload(), 2000);
+                setTimeout(() => location.reload(), 3000);
             }
         }
-        
+
+        async function submitSuspicionScore() {
+            // Create minimum 2 second combined delay before submitting score.
+            // Otherwise adjust time in Phase 2 to prevent a TIMING_VIOLATION.
+
+            status('Loading tests and analyzing browser...');
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            status('Just hang on. We are almost there...');
+            await new Promise(resolve => setTimeout(resolve, 600));
+
+            status('Fetching challenge...');
+            await new Promise(resolve => setTimeout(resolve, 500));
+
+            // Run client tests and get suspicion score
+            const clientSuspicion = detectClientSuspicion();
+
+            const res = await fetch(location.href, {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                    'X-PoW-Client-Suspicion': clientSuspicion.toString()
+                }
+            });
+            if (!res.ok) { throw new Error('Suspicion score rejected'); }
+
+            const challenge = res.headers.get('X-PoW-Challenge');
+            if (!challenge) { throw new Error('No challenge received from server'); }
+            return challenge;
+        }
+
         async function main() {
             try {
                 if (!crypto.subtle) throw new Error('Web Crypto not available');
-                const { nonce, elapsed } = await solve();
-                await submit(nonce, elapsed);
+                // Phase 2: Submit suspicion score, receive challenge + difficulty
+                const challenge = await submitSuspicionScore();
+                // Phase 3: Solve & submit PoW solution with server-assigned challenge and difficulty
+                const { nonce, elapsed } = await solve(challenge);
+                await submit(challenge, nonce, elapsed);
             } catch (e) {
                 status('Error: ' + e.message);
                 console.error(e);
             }
         }
-        
+
         main();
     </script>
 </body>
 </html>]]
 
-    -- Some very basic minification stripping comments, newlines, and excessive spaces
-    html = html:gsub("([^:])//[^\n]*", "%1")
-    html = html:gsub("\n+", " ")
-    html = html:gsub("  +", " ")
-    html = html:gsub(">%s+<", "><")
+        -- Some very basic minification stripping comments, newlines, and excessive spaces
+        html = html:gsub("([^:])//[^\n]*", "%1")
+        html = html:gsub("\n+", " ")
+        html = html:gsub("  +", " ")
+        html = html:gsub(">%s+<", "><")
 
-    ngx_say(html)
-    ngx_exit(403)
-end
+        ngx_say(html)
+        ngx_exit(403)
+    end -- Client suspicion test, PoW challenge, and solution submission
+end  -- _M.check
 
 return _M
