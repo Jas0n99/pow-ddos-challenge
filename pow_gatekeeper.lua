@@ -530,12 +530,14 @@ function _M.check(custom_difficulty)
             max-width: 420px; 
             width: 100%;
         }
-        .logo { width: 60px; height: auto; margin-bottom: 1.5rem; filter: drop-shadow(0 4px 6px rgba(255,129,0,0.3)); }
-        .spinner-box { position: relative; width: 60px; height: 60px; margin: 0 auto 1.5rem; }
-        .spinner { width: 100%; height: 100%; border: 3px solid rgba(255,129,0,0.2); border-top-color: #ff8100; border-radius: 50%; animation: spin 1s linear infinite; }
-        .checkmark { display: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); width: 30px; height: 30px; color: #22c55e; }
+        .spinner-box { position: relative; width: 100px; height: 100px; margin: 0 auto 1.5rem; }
+        .spinner { width: 100%; height: 100%; border: 4px solid rgba(255,129,0,0.2); border-top-color: #ff8100; border-radius: 50%; animation: spin 1s linear infinite; }
+        .checkmark { display: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); width: 150px; height: 150px; color: #22c55e; }
+        .xmark { display: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); width: 150px; height: 150px; color: #ef4444; }
         .success .spinner { display: none; }
         .success .checkmark { display: block; }
+        .failure .spinner { display: none; }
+        .failure .xmark { display: block; }
         @keyframes spin { to { transform: rotate(360deg); } }
         h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 0.75rem; background: linear-gradient(90deg,#ff8100,#ffb366); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
         p { color: rgba(255,255,255,0.7); font-size: 0.9rem; line-height: 1.5; }
@@ -553,20 +555,14 @@ function _M.check(custom_difficulty)
         </div>
     </noscript>
     <div class="container" id="main">
-        <svg class="logo" viewBox="0 0 75.946663 87.348663" xmlns="http://www.w3.org/2000/svg">
-            <g transform="matrix(1.3333333,0,0,-1.3333333,-156.02933,329.57066)">
-                <g style="fill:#ff8100" transform="translate(124.022,201.5)">
-                    <path d="M 0,0 H 42.96 V 21.321 L 21.48,37.01 0,21.321 Z M 49.96,-7 H -7 V 24.877 L 21.48,45.678 49.96,24.877 Z"/>
-                </g>
-                <g style="fill:#ff8100" transform="translate(159.3359,181.6665)">
-                    <path d="M 0,0 H -7 V 29.167 H -20.5 V 0 h -7 V 36.167 H 0 Z"/>
-                </g>
-            </g>
-        </svg>
         <div class="spinner-box">
             <div class="spinner"></div>
-            <svg class="checkmark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+            <svg class="checkmark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <polyline points="20 6 9 17 4 12"></polyline>
+            </svg>
+            <svg class="xmark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+            <line x1="18" y1="6" x2="6" y2="18"></line>
             </svg>
         </div>
         <h1>Verifying your connection</h1>
@@ -841,9 +837,11 @@ function _M.check(custom_difficulty)
                 setTimeout(() => location.reload(), 1000);
             } else if (res.status === 429) {
                 status('Too many attempts. Please wait...');
+                document.querySelector('.spinner-box').classList.add('failure');
                 setTimeout(() => location.reload(), 60000);
             } else {
                 status('Verification failed. Retrying...');
+                document.querySelector('.spinner-box').classList.add('failure');
                 setTimeout(() => location.reload(), 3000);
             }
         }
