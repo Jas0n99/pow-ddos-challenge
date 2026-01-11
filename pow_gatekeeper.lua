@@ -36,7 +36,7 @@
     Debian/Ubuntu Requirements:
     - libnginx-mod-http-lua (For basic lua)
     - lua-nginx-string (For sha256)
-    - Shared memory zone (See sample config 'pow_ddos_challenge.conf')
+    - Shared memory zone (See sample config 'pow_gatekeeper_.conf')
     
     Challenge Format:
         signature-timestamp-difficulty
@@ -61,7 +61,7 @@
 local _M = {}
 
 -- Configuration
-local config = require("pow_ddos_config")
+local config = require("pow_gatekeeper_config")
 
 -- Shared memory for rate limiting
 local rate_limit_dict = ngx.shared[config.shared_zone]
