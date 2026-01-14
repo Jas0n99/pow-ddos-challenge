@@ -36,7 +36,7 @@
     Debian/Ubuntu Requirements:
     - libnginx-mod-http-lua (For basic lua)
     - lua-nginx-string (For sha256)
-    - Shared memory zone (See sample config 'pow_gatekeeper_.conf')
+    - Shared memory zone (See sample config 'pow_gatekeeper.conf')
     
     Challenge Format:
         signature-timestamp-difficulty
@@ -90,6 +90,16 @@ local tonumber = tonumber
 local function signature(str)
     local hash = encode_base64(hmac_sha1(config.secret, str))
     return hash:gsub("[+]", "-"):gsub("[/]", "_"):gsub("[=]", "")
+end
+
+-- Log challenge metrics
+local function log_challenge(event, remote_addr, data)
+    local msg = string.format("[PoW] %s remote_addr=%s", event, remote_addr)
+    for k, v in pairs(data or {}) do
+        msg = msg .. string.format(" %s=%s", k, tostring(v))
+    end
+--    ngx_log(INFO, msg)
+    ngx_log(WARN, msg)
 end
 
 -- Get client IP (secure proxy handling)
@@ -190,6 +200,12 @@ local function check_rate_limit(remote_addr)
     end
     
     if count > config.rate_limit then
+        -- reset TTL to full window from now
+        local ok, err = rate_limit_dict:expire(key, 60)
+        if not ok then
+            ngx_log(ERR, "[PoW] Failed to reset TTL: ", err)
+        end
+
         log_challenge("RATE_LIMITED", remote_addr, {
             rate_count = count,
             rate_limit = config.rate_limit
@@ -275,16 +291,6 @@ local function is_suspiciously_fast(test_difficulty, solve_time_ms)
     return solve_time_ms < threshold
 end
 
--- Log challenge metrics
-local function log_challenge(event, remote_addr, data)
-    local msg = string.format("[PoW] %s remote_addr=%s", event, remote_addr)
-    for k, v in pairs(data or {}) do
-        msg = msg .. string.format(" %s=%s", k, tostring(v))
-    end
---    ngx_log(INFO, msg)
-    ngx_log(WARN, msg)
-end
-
 -- Main logic is a function that either returns to continue the lua_block in nginx or returns an error response
 function _M.check(custom_difficulty)
     -- ACME Challenge Bypass - Always allow Let's Encrypt certificate renewal
@@ -305,8 +311,7 @@ function _M.check(custom_difficulty)
     local time_bucket = math_floor(tonumber(current_time) / tonumber(config.expire_time))
     local host = ngx_var.host
 
-    -- Cookie check (unique per client, per hostname)
-    -- Removed cookie_exp, the token is either valid within the time bucket, or it's not.
+    -- Cookie check (unique per client, per hostname). Removed cookie_exp, the token is either valid within the time bucket, or it's not.
     local cookie_token = "_pow_" .. signature(remote_addr .. host .. "token"):sub(1, 8)
     local token = ngx_var["cookie_" .. cookie_token] or ""
     local expected_token = signature(remote_addr .. host .. config.secret .. time_bucket)
@@ -445,7 +450,7 @@ function _M.check(custom_difficulty)
 
         if ts_start then
             local ts_elapsed = ngx_now() - ts_start
-            if ts_elapsed < 2 then
+            if ts_elapsed < 1 then
                 -- Penalize by adding to their suspicion score
                 log_challenge("TIMING_VIOLATION", remote_addr, {
                     ts_elapsed = ts_elapsed,
@@ -572,15 +577,15 @@ function _M.check(custom_difficulty)
     </div>
 
     <script type="module">
-        const quotes = ["I'm gonna make him an offer he can't refuse.", "I coulda had class. I coulda been a contender.", "I am one with the Force, and the Force is with me.",
-            "Here's looking at you, kid.", "Go ahead, make my day.", "May the Force be with you.", "You talking to me?", "Fasten your seatbelts.", "I'll be back.", "Here's Johnny!",
-            "What we've got here is failure to communicate.", "Never tell me the odds!", "Made it, Ma! Top of the world!", "A census taker once tried to test me.",
-            "Bond. James Bond.", "There's no place like home.", "Show me the money!", "I'm walking here! I'm walking here!", "You can't handle the truth!", "I want to be alone.",
-            "I'll have what she's having.", "Round up the usual suspects.", "You're gonna need a bigger boat.", "Badges? We ain't got no badges!", "If you build it, he will come.",
-            "We'll always have Paris.", "Stella! Hey, Stella!", "Well, nobody's perfect.", "It's alive! It's alive!", "Houston, we have a problem.", "There's no crying in baseball!",
-            "Say hello to my little friend!", "What a dump.", "Elementary, my dear Watson.", "The cake is a lie.", "Is it safe?", "Wait a minute, wait a minute.",
-            "Soylent Green is people!", "Open the pod bay doors, HAL.", "Toga! Toga!", "My precious.", "Who's on first.", "I feel the need, the need for speed!", "Hello there.",
-            "Snap out of it!", "Do or do not. There is no try.", "They're here!", "I'm the king of the world!", "It's a trap!", "I don't think he knows about second breakfast, pip."];
+//        const quotes = ["I'm gonna make him an offer he can't refuse.", "I coulda had class. I coulda been a contender.", "I am one with the Force, and the Force is with me.",
+//            "Here's looking at you, kid.", "Go ahead, make my day.", "May the Force be with you.", "You talking to me?", "Fasten your seatbelts.", "I'll be back.", "Here's Johnny!",
+//            "What we've got here is failure to communicate.", "Never tell me the odds!", "Made it, Ma! Top of the world!", "A census taker once tried to test me.",
+//           "Bond. James Bond.", "There's no place like home.", "Show me the money!", "I'm walking here! I'm walking here!", "You can't handle the truth!", "I want to be alone.",
+//            "I'll have what she's having.", "Round up the usual suspects.", "You're gonna need a bigger boat.", "Badges? We ain't got no badges!", "If you build it, he will come.",
+//            "We'll always have Paris.", "Stella! Hey, Stella!", "Well, nobody's perfect.", "It's alive! It's alive!", "Houston, we have a problem.", "There's no crying in baseball!",
+//            "Say hello to my little friend!", "What a dump.", "Elementary, my dear Watson.", "The cake is a lie.", "Is it safe?", "Wait a minute, wait a minute.",
+//            "Soylent Green is people!", "Open the pod bay doors, HAL.", "Toga! Toga!", "My precious.", "Who's on first.", "I feel the need, the need for speed!", "Hello there.",
+//            "Snap out of it!", "Do or do not. There is no try.", "They're here!", "I'm the king of the world!", "It's a trap!", "I don't think he knows about second breakfast, pip."];
 
         // Challenge will be received from server after suspicion score submission
         const $ = id => document.getElementById(id);
@@ -674,10 +679,10 @@ function _M.check(custom_difficulty)
             if ( (/\bIntel Mac OS X\b|\bCPU (?:iPhone |iPad )?OS\b/.test(ua)) && ua.includes('Safari') && !/Chrome|Edg|Firefox/.test(ua) && !window.safari ) { score += 1; reasons.push(`${score} (Safari mismatch)`); }  // Claims Safari but missing
 
             // Bots fake 1-2 cores, humans 4-16+
-            if(navigator.hardwareConcurrency <= 2) { score += 2; reasons.push(`${score} (Low cores)`); }
+            if(navigator.hardwareConcurrency <= 1) { score += 1; reasons.push(`${score} (Low cores)`); }
 
             // Webdriver flag (Selenium, Puppeteer, Playwright)
-            if (navigator.webdriver === true) { score += 3; reasons.push(`${score} (Webdriver)`); }
+            if (navigator.webdriver === true) { score += 2; reasons.push(`${score} (Webdriver)`); }
             
             // Missing language preferences
             if (!navigator.languages || navigator.languages.length === 0) { score += 2; reasons.push(`${score} (No languages)`); }
@@ -757,13 +762,13 @@ function _M.check(custom_difficulty)
             if (mouseVelocities.length > 10) {
                 const avgVelocity = mouseVelocities.reduce((a,b) => a+b, 0) / mouseVelocities.length;
                 const variance = mouseVelocities.reduce((sum, v) => sum + Math.pow(v - avgVelocity, 2), 0) / mouseVelocities.length;
-                // console.log('Mouse variance analysis:', { avgVelocity: avgVelocity.toFixed(4), variance: variance.toFixed(6), threshold: 0.00001 });
+                // console.log('Mouse variance analysis:', { avgVelocity: avgVelocity.toFixed(4), variance: variance.toFixed(6), threshold: 0.0001 });
                 // Real humans have high variance (natural jitter), bots are too smooth
-                if (variance < 0.00001) { score += 2; reasons.push(`${score} (Robotic mouse, variance: ${variance.toFixed(4)})`); }
+                if (variance < 0.0001) { score += 1; reasons.push(`${score} (Robotic mouse, variance: ${variance.toFixed(4)})`); }
             }
             
             // Teleporting mouse (instant jumps - clear bot indicator)
-            if (mouseTeleports > 2) { score += 2; reasons.push(`${score} (Mouse teleports: ${mouseTeleports})`); }
+            if (mouseTeleports > 2) { score += 1; reasons.push(`${score} (Mouse teleports: ${mouseTeleports})`); }
 
             // Debug output
             // console.log('Detection reasons:', reasons);
@@ -800,13 +805,13 @@ function _M.check(custom_difficulty)
             const CHUNK_SIZE = 5000;
 
             // Just for fun...
-            const quoteTimer = setInterval(() => { status(quotes[Math.floor(Math.random() * quotes.length)]); }, 5000);
+//            const quoteTimer = setInterval(() => { status(quotes[Math.floor(Math.random() * quotes.length)]); }, 5000);
 
             while (true) {
                 for (let i = 0; i < CHUNK_SIZE; i++) {
                     hash = await sha256(challenge + nonce);
                     if (hash.startsWith(TARGET)) {
-                        clearInterval(quoteTimer);
+//                        clearInterval(quoteTimer);
                         const elapsed = performance.now() - startTime;
                         stats(`${nonce.toLocaleString()} hashes in ${(elapsed/1000).toFixed(2)}s`);
                         return { nonce: nonce.toString(), elapsed: Math.round(elapsed) };
@@ -834,7 +839,7 @@ function _M.check(custom_difficulty)
             if (res.status === 204 || res.ok) {
                 status('Verified! Redirecting...');
                 document.querySelector('.spinner-box').classList.add('success');
-                setTimeout(() => location.reload(), 1000);
+                setTimeout(() => location.reload(), 600);
             } else if (res.status === 429) {
                 status('Too many attempts. Please wait...');
                 document.querySelector('.spinner-box').classList.add('failure');
@@ -847,17 +852,17 @@ function _M.check(custom_difficulty)
         }
 
         async function submitSuspicionScore() {
-            // Create minimum 2 second combined delay before submitting score.
+            // Create minimum 1 second combined delay before submitting score.
             // Otherwise adjust time in Phase 2 to prevent a TIMING_VIOLATION.
 
             status('Loading tests and analyzing browser...');
-            await new Promise(resolve => setTimeout(resolve, 1000));
+            await new Promise(resolve => setTimeout(resolve, 800));
 
             status('Just hang on. We are almost there...');
-            await new Promise(resolve => setTimeout(resolve, 600));
+            await new Promise(resolve => setTimeout(resolve, 400));
 
             status('Fetching challenge...');
-            await new Promise(resolve => setTimeout(resolve, 500));
+            await new Promise(resolve => setTimeout(resolve, 300));
 
             // Run client tests and get suspicion score
             const clientSuspicion = detectClientSuspicion();
