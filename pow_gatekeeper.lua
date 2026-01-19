@@ -10,7 +10,7 @@
     Custom fork by: Jas0n99
     https://github.com/Jas0n99/pow-ddos-challenge
 
-    Version: 1.1.1
+    Version: 1.1.2
     Last Updated: 2026-01-19
 
     Security Features:
@@ -569,8 +569,8 @@ function _M.check(custom_difficulty)
             <line x1="18" y1="6" x2="6" y2="18"></line>
             </svg>
         </div>
-        <h1>Verifying your connection</h1>
-        <p>Completing a quick security challenge to protect against automated attacks.</p>
+        <h1>Verifying you are human...</h1>
+        <p>Completing a quick security challenge to protect against bots, scrapers, and automated attacks.</p>
         <div class="status" id="status">Initializing...</div>
         <div class="stats" id="stats"></div>
     </div>
@@ -821,15 +821,16 @@ function _M.check(custom_difficulty)
             });
             
             if (res.status === 204 || res.ok) {
-                status('Verified! Redirecting...');
+                status('Verification successful! Redirecting...');
+                stats('Waiting for server to respond...');
                 document.querySelector('.spinner-box').classList.add('success');
-                setTimeout(() => location.reload(), 600);
+                setTimeout(() => location.reload(), 1000);
             } else if (res.status === 429) {
-                status('Too many attempts. Please wait...');
+                status('Too many attempts! Please wait...');
                 document.querySelector('.spinner-box').classList.add('failure');
                 setTimeout(() => location.reload(), 60000);
             } else {
-                status('Verification failed. Retrying...');
+                status('Verification failed! Retrying...');
                 document.querySelector('.spinner-box').classList.add('failure');
                 setTimeout(() => location.reload(), 3000);
             }
@@ -840,13 +841,13 @@ function _M.check(custom_difficulty)
             // Otherwise adjust time in Phase 2 to prevent a TIMING_VIOLATION.
 
             status('Loading tests and analyzing browser...');
-            await new Promise(resolve => setTimeout(resolve, 800));
+            await new Promise(resolve => setTimeout(resolve, 1000));
 
             status('Just hang on. We are almost there...');
-            await new Promise(resolve => setTimeout(resolve, 400));
+            await new Promise(resolve => setTimeout(resolve, 500));
 
             status('Fetching challenge...');
-            await new Promise(resolve => setTimeout(resolve, 300));
+            await new Promise(resolve => setTimeout(resolve, 200));
 
             // Run client tests and get suspicion score
             const clientSuspicion = detectClientSuspicion();
@@ -858,7 +859,18 @@ function _M.check(custom_difficulty)
                     'X-PoW-Client-Suspicion': clientSuspicion.toString()
                 }
             });
-            if (!res.ok) { throw new Error('Suspicion score rejected'); }
+            if (!res.ok) {
+                if (res.status === 429) {
+                    status('Too many attempts! Please wait...');
+                    document.querySelector('.spinner-box').classList.add('failure');
+                    const retryAfter = res.headers.get('Retry-After') || '60';
+                    stats(`Page will auto-refresh after ${retryAfter} seconds.`);
+                    setTimeout(() => location.reload(), parseInt(retryAfter) * 1000);
+                    // Prevent further execution
+                    await new Promise(() => {});
+                }
+                throw new Error('Suspicion score rejected!');
+            }
 
             const challenge = res.headers.get('X-PoW-Challenge');
             if (!challenge) { throw new Error('No challenge received from server'); }
