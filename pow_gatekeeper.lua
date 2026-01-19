@@ -10,8 +10,8 @@
     Custom fork by: Jas0n99
     https://github.com/Jas0n99/pow-ddos-challenge
 
-    Version: 1.1.0
-    Last Updated: 2026-01-10
+    Version: 1.1.1
+    Last Updated: 2026-01-19
 
     Security Features:
     - SHA256 proof-of-work with configurable difficulty (1-7)
@@ -19,7 +19,7 @@
     - Server-side bot fingerprinting from HTTP headers
     - Client-side bot fingerprinting (defense in depth, can increase difficulty)
     - Two-phase challenge: client suspicion score calculated and sent back first before recieving final difficulty and challenge
-    - Enforced JavaScript timing delay with server-side verification / penalty
+    - JavaScript timing delay with server-side verification / notification
     - Difficulty 7 "honeypot" - only fake engines trigger this, then get rejected after wasting their time
     - Nonce replay prevention (each solution valid only once)
     - Challenge expiry (5-minute window)
@@ -149,9 +149,6 @@ local function detect_server_suspicion(headers)
                or ua:match("bot") or ua:match("Bot") or ua:match("crawler") 
                or ua:match("spider") or ua:match("scraper") then
             score = score + 2
---        elseif ua:match("Linux") and not ua:match("Android") then
-            -- Linux desktop browsers are rare, more often are bots
---            score = score + 1
         end
     else
         -- Not a string (nil, table, etc) - missing UA is very suspicious
@@ -189,7 +186,7 @@ local function detect_server_suspicion(headers)
     return math_min(score, 6)  -- Cap at 6
 end
 
--- Rate limiting check
+-- Rate limiting check / increment
 local function check_rate_limit(remote_addr)
     local key = "pow:" .. remote_addr
     local count, err = rate_limit_dict:incr(key, 1, 0, 60)  -- 60 second window, does not update TTL on existing key
@@ -457,7 +454,9 @@ function _M.check(custom_difficulty)
                     client_suspicion = client_suspicion,
                     rate_count = rate_count
                 })
---                client_suspicion = client_suspicion + 2
+                -- We need to create some unique token to tie the timer to the check before penalizing.
+                -- Issue is when browser requests multiple pages at once we don't know which is which.
+                -- client_suspicion = client_suspicion + 2
             end
         else
             -- Challenge expired or never started
