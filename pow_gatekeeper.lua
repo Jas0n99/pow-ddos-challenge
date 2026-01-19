@@ -149,9 +149,9 @@ local function detect_server_suspicion(headers)
                or ua:match("bot") or ua:match("Bot") or ua:match("crawler") 
                or ua:match("spider") or ua:match("scraper") then
             score = score + 2
-        elseif ua:match("Linux") and not ua:match("Android") then
+--        elseif ua:match("Linux") and not ua:match("Android") then
             -- Linux desktop browsers are rare, more often are bots
-            score = score + 1
+--            score = score + 1
         end
     else
         -- Not a string (nil, table, etc) - missing UA is very suspicious
@@ -457,7 +457,7 @@ function _M.check(custom_difficulty)
                     client_suspicion = client_suspicion,
                     rate_count = rate_count
                 })
-                client_suspicion = client_suspicion + 2
+--                client_suspicion = client_suspicion + 2
             end
         else
             -- Challenge expired or never started
@@ -472,7 +472,7 @@ function _M.check(custom_difficulty)
 
         -- Calculate difficulty based on server-side detection
         local server_suspicion = detect_server_suspicion(headers)
-        local effective_difficulty = math_min(pow_difficulty + math_floor(server_suspicion + client_suspicion / 2), 7)
+        local effective_difficulty = math_min(pow_difficulty + math_floor((server_suspicion + client_suspicion) / 2), 7)
 
         -- Generate new challenge with embedded difficulty
         local challenge = generate_challenge(remote_addr, host, effective_difficulty, current_time)
@@ -575,18 +575,7 @@ function _M.check(custom_difficulty)
         <div class="status" id="status">Initializing...</div>
         <div class="stats" id="stats"></div>
     </div>
-
     <script type="module">
-//        const quotes = ["I'm gonna make him an offer he can't refuse.", "I coulda had class. I coulda been a contender.", "I am one with the Force, and the Force is with me.",
-//            "Here's looking at you, kid.", "Go ahead, make my day.", "May the Force be with you.", "You talking to me?", "Fasten your seatbelts.", "I'll be back.", "Here's Johnny!",
-//            "What we've got here is failure to communicate.", "Never tell me the odds!", "Made it, Ma! Top of the world!", "A census taker once tried to test me.",
-//           "Bond. James Bond.", "There's no place like home.", "Show me the money!", "I'm walking here! I'm walking here!", "You can't handle the truth!", "I want to be alone.",
-//            "I'll have what she's having.", "Round up the usual suspects.", "You're gonna need a bigger boat.", "Badges? We ain't got no badges!", "If you build it, he will come.",
-//            "We'll always have Paris.", "Stella! Hey, Stella!", "Well, nobody's perfect.", "It's alive! It's alive!", "Houston, we have a problem.", "There's no crying in baseball!",
-//            "Say hello to my little friend!", "What a dump.", "Elementary, my dear Watson.", "The cake is a lie.", "Is it safe?", "Wait a minute, wait a minute.",
-//            "Soylent Green is people!", "Open the pod bay doors, HAL.", "Toga! Toga!", "My precious.", "Who's on first.", "I feel the need, the need for speed!", "Hello there.",
-//            "Snap out of it!", "Do or do not. There is no try.", "They're here!", "I'm the king of the world!", "It's a trap!", "I don't think he knows about second breakfast, pip."];
-
         // Challenge will be received from server after suspicion score submission
         const $ = id => document.getElementById(id);
         const status = msg => $('status').textContent = msg;
@@ -682,7 +671,7 @@ function _M.check(custom_difficulty)
             if(navigator.hardwareConcurrency <= 1) { score += 1; reasons.push(`${score} (Low cores)`); }
 
             // Webdriver flag (Selenium, Puppeteer, Playwright)
-            if (navigator.webdriver === true) { score += 2; reasons.push(`${score} (Webdriver)`); }
+            if (navigator.webdriver === true) { score += 1; reasons.push(`${score} (Webdriver)`); }
             
             // Missing language preferences
             if (!navigator.languages || navigator.languages.length === 0) { score += 2; reasons.push(`${score} (No languages)`); }
@@ -697,13 +686,13 @@ function _M.check(custom_difficulty)
             if (document.documentElement.getAttribute('selenium') !== null) { score += 3; reasons.push(`${score} (Selenium attr)`); }
             
             // Zero screen dimensions (headless default)
-            if (screen.width === 0 || screen.height === 0) { score += 2; reasons.push(`${score} (Zero screen)`); }
+            if (screen.width === 0 || screen.height === 0) { score += 1; reasons.push(`${score} (Zero screen)`); }
 
             // Virtual viewport
-            if(window.outerWidth === 0 || screen.availWidth === 0) { score += 2; reasons.push(`${score} (Virtual viewport)`); }
+            if(window.outerWidth === 0 || screen.availWidth === 0) { score += 1; reasons.push(`${score} (Virtual viewport)`); }
 
             // Missing standard browser features
-            if (typeof window.onmousemove === 'undefined' && typeof window.ontouchstart === 'undefined') { score += 2; reasons.push(`${score} (No mouse/touch)`); }
+            if (typeof window.onmousemove === 'undefined' && typeof window.ontouchstart === 'undefined') { score += 1; reasons.push(`${score} (No mouse/touch)`); }
 
             // Permission state (headless + missing API)
             // intentionally ignore "denied"
@@ -731,7 +720,7 @@ function _M.check(custom_difficulty)
             try {
                 null.f();
             } catch(e) {
-                if (!e.stack || e.stack.split('\n').length < 2) { score += 2; reasons.push(`${score} (Bad stack)`); }
+                if (!e.stack || e.stack.split('\n').length < 2) { score += 1; reasons.push(`${score} (Bad stack)`); }
             }
 
             // Canvas fingerprinting anomaly
@@ -743,7 +732,7 @@ function _M.check(custom_difficulty)
             const sum = Array.from(ctx.getImageData(0,0,10,10).data).reduce((a,b)=>a+b,0);
             // const pixels = ctx.getImageData(0, 0, 10, 10).data;
             // const sum = Array.from(pixels).reduce((a, b) => a + b, 0);
-            if (sum === 0 || sum === 2550) { score += 2; reasons.push(`${score} (Canvas anomaly ${sum})`); }  // Suspiciously uniform
+            if (sum === 0 || sum === 2550) { score += 1; reasons.push(`${score} (Canvas anomaly ${sum})`); }  // Suspiciously uniform
 
             // WebGL vendor detection (VMs have telltale signatures)
             const gl = document.createElement('canvas').getContext('webgl');
@@ -804,14 +793,10 @@ function _M.check(custom_difficulty)
             let hash = '';
             const CHUNK_SIZE = 5000;
 
-            // Just for fun...
-//            const quoteTimer = setInterval(() => { status(quotes[Math.floor(Math.random() * quotes.length)]); }, 5000);
-
             while (true) {
                 for (let i = 0; i < CHUNK_SIZE; i++) {
                     hash = await sha256(challenge + nonce);
                     if (hash.startsWith(TARGET)) {
-//                        clearInterval(quoteTimer);
                         const elapsed = performance.now() - startTime;
                         stats(`${nonce.toLocaleString()} hashes in ${(elapsed/1000).toFixed(2)}s`);
                         return { nonce: nonce.toString(), elapsed: Math.round(elapsed) };
