@@ -18,12 +18,12 @@
     - HMAC-signed challenges with embedded difficulty (tamper-proof)
     - Server-side bot fingerprinting from HTTP headers
     - Client-side bot fingerprinting (defense in depth, can increase difficulty)
-    - Two-phase challenge: client suspicion score calculated and sent back first before recieving final difficulty and challenge
+    - Three-phase challenge: client suspicion score calculated and sent back first before recieving final difficulty and challenge
     - JavaScript timing delay with server-side verification / notification
     - Difficulty 7 "honeypot" - only fake engines trigger this, then get rejected after wasting their time
     - Nonce replay prevention (each solution valid only once)
     - Challenge expiry (5-minute window)
-    - Per-IP rate limiting on challenge requests
+    - Per-IP, per-host rate limiting on challenge requests
     - Secure proxy mode configuration (prevents IP spoofing)
     - Suspiciously fast solve detection with rechallenge mechanism
     - ACME challenge bypass for SSL certificate renewal
@@ -40,7 +40,7 @@
     
     Challenge Format:
         signature-timestamp-difficulty
-        The signature covers IP + timestamp + difficulty + secret, preventing tampering.
+        The signature covers IP + host + timestamp + difficulty + secret, preventing tampering.
     
     Log Events:
         [PoW] ISSUED            - New challenge generated
