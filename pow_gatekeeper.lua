@@ -26,7 +26,7 @@
     - Per-IP, per-host rate limiting on challenge requests
     - Secure proxy mode configuration (prevents IP spoofing)
     - Suspiciously fast solve detection with rechallenge mechanism
-    - ACME challenge bypass for SSL certificate renewal
+    - robots.txt, ads.txt, favicon.ico, and /.well-known/ bypass due to necessary universal access
     
     Browser Requirements:
     - Web Crypto API (blocks Node.js and simple HTTP clients)
@@ -290,8 +290,8 @@ end
 
 -- Main logic is a function that either returns to continue the lua_block in nginx or returns an error response
 function _M.check(custom_difficulty)
-    -- ACME Challenge Bypass - Always allow Let's Encrypt certificate renewal
-    if ngx_var.uri:match("^/.well%-known/acme%-challenge/") then
+    -- Common locations and files to always bypass
+    if ngx_var.uri:match("^/%.well%-known/") or ngx_var.uri:match("^/robots%.txt") or ngx_var.uri:match("^/ads%.txt") or ngx_var.uri:match("^/favicon%.ico") then
         return
     end
 
