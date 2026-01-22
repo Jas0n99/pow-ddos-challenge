@@ -19,13 +19,13 @@ If you wanted to be truely nefarious for a known bot, you could force the highes
     2. Client then receives a server-set difficulty level, and server-generated challenge to complete
     3. Client must submit valid completed challenge to be authenticated
 - Optimized with Nginx internal table shortcuts for better performance
-- Included the hostname as part of the tracking method to prevent cross-site issues / exploitation
-- Removed extra cookie with exp time as it was not secure nor necessary, the exp time is embedded in the main cookie hash.
+- Included the hostname and uri as part of the challenge and some tracking methods to prevent cross-site issues / exploitation / race conditions
 - Additional server side and client side (JavaScript) suspicion tests
 - Difficulty level 7 "honeypot" - only fake engines trigger this, then get rejected after wasting their time
 - Suspiciously fast solve detection with random jitter and rechallenge (helps prevent against SHA256 acceleration methods)
+- JavaScript timing delay with server-side verification / notification / penalty
 - Some very basic minification stripping comments, newlines, and excessive spaces from output
-- ACME challenge bypass for SSL certificate renewal
+- robots.txt, ads.txt, favicon.ico, and /.well-known/ bypass due to necessary universal access
 
 ### Requirements
 - libnginx-mod-http-lua
