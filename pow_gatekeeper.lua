@@ -10,21 +10,21 @@
     Custom fork by: Jas0n99
     https://github.com/Jas0n99/pow-ddos-challenge
 
-    Version: 1.1.2
-    Last Updated: 2026-01-19
+    Version: 1.1.3
+    Last Updated: 2026-01-22
 
     Security Features:
     - SHA256 proof-of-work with configurable difficulty (1-7)
-    - HMAC-signed challenges with embedded difficulty (tamper-proof)
+    - HMAC-signed challenges with embedded difficulty and timestamps (tamper-proof)
     - Server-side bot fingerprinting from HTTP headers
-    - Client-side bot fingerprinting (defense in depth, can increase difficulty)
-    - Three-phase challenge: client suspicion score calculated and sent back first before recieving final difficulty and challenge
-    - JavaScript timing delay with server-side verification / notification
-    - Difficulty 7 "honeypot" - only fake engines trigger this, then get rejected after wasting their time
+    - Client-side bot fingerprinting from JavaScript (defense in depth, can increase difficulty)
     - Nonce replay prevention (each solution valid only once)
     - Challenge expiry (5-minute window)
-    - Per-IP, per-host rate limiting on challenge requests
+    - IP rate limiting on challenge requests
     - Secure proxy mode configuration (prevents IP spoofing)
+    - Three-phase challenge: client suspicion score calculated and sent back first before recieving final difficulty and challenge
+    - Difficulty 7 "honeypot" - only fake engines trigger this, then get rejected after wasting their time
+    - JavaScript timing delay with server-side verification / notification
     - Suspiciously fast solve detection with rechallenge mechanism
     - robots.txt, ads.txt, favicon.ico, and /.well-known/ bypass due to necessary universal access
     
@@ -40,7 +40,7 @@
     
     Challenge Format:
         signature-timestamp-difficulty
-        The signature covers IP + host + timestamp + difficulty + secret, preventing tampering.
+        To preventing tampering, the signature covers IP + host + uri + timestamp + difficulty + secret
     
     Log Events:
         [PoW] ISSUED            - New challenge generated
@@ -64,7 +64,7 @@ local _M = {}
 local config = require("pow_gatekeeper_config")
 
 -- Shared memory for rate limiting
-local rate_limit_dict = ngx.shared[config.shared_zone]
+local rate_limit_dict = ngx.shared.pow_rate_limit
 
 -- These create "shortcuts" to the Nginx internal tables, which is faster for the LuaJIT compiler to process.
 local ngx_var = ngx.var
@@ -80,6 +80,7 @@ local WARN = ngx.WARN
 local ERR = ngx.ERR
 local encode_base64 = ngx.encode_base64
 local hmac_sha1 = ngx.hmac_sha1
+local ngx_md5 = ngx.md5
 local string_rep = string.rep
 local math_floor = math.floor
 local math_max = math.max
@@ -130,12 +131,14 @@ local function detect_server_suspicion(headers)
     local score = 0
     
     -- Missing Accept-Language (all real browsers send this)
-    if not headers["accept-language"] then
+    local language = headers["accept-language"]
+    if type(language) ~= "string" or language == "" then
         score = score + 2
     end
     
-    -- Missing Accept-Encoding (all real browsers send this)
-    if not headers["accept-encoding"] then
+    -- Missing Accept-Encoding (all real browsers send this), or just gzip
+    local ae = headers["accept-encoding"]
+    if type(ae) ~= "string" or ae:lower() == "gzip" or ae:lower() == "gzip, deflate" then
         score = score + 1
     end
     
@@ -161,14 +164,21 @@ local function detect_server_suspicion(headers)
     end
     
     -- Missing Sec-Fetch headers (modern browsers always send these)
-    if not headers["sec-fetch-mode"] and not headers["sec-fetch-site"] then
+    if not headers["sec-fetch-mode"] 
+        or not headers["sec-fetch-site"]
+        or not headers["sec-fetch-dest"]
+        or not headers["sec-ch-ua"]
+        or not headers["sec-ch-ua-mobile"]
+        or not headers["sec-ch-ua-platform"]
+    then
         -- Could be older browser, minor penalty
         score = score + 1
     end
 
     -- Missing Accept header
-    if not headers["accept"] then
-        score = score + 1
+    local accept = headers["accept"]
+    if type(accept) ~= "string" or accept == "" then
+        score = score + 2
     end
     
     -- Connection header anomalies
@@ -183,7 +193,17 @@ local function detect_server_suspicion(headers)
         score = score + 2
     end
 
-    return math_min(score, 6)  -- Cap at 6
+    -- Some headers that probably only a real browser would have and bots wouldn't care
+    if headers["priority"] or headers["sec-gpc"] or headers["dnt"] then
+        score = score - 1
+    end
+
+    -- More headers that probably only a real browser would have and bots wouldn't care
+    if headers["upgrade-insecure-requests"] or headers["cookie"] then
+        score = score - 1
+    end
+
+    return math_max(0, math_min(score, 6))
 end
 
 -- Rate limiting check / increment
@@ -218,15 +238,15 @@ local function check_rate_limit(remote_addr)
 end
 
 -- Generate challenge string with embedded difficulty (tamper-proof)
-local function generate_challenge(remote_addr, host, difficulty, current_time)
+local function generate_challenge(remote_addr, host, uri, difficulty, current_time)
     -- Include host and difficulty in signature to prevent tampering and cross site reuse
-    local data = remote_addr .. ":" .. host .. ":" .. current_time .. ":" .. difficulty .. ":" .. config.secret
+    local data = remote_addr .. ":" .. host .. ":" .. uri .. ":" .. current_time .. ":" .. difficulty .. ":" .. config.secret
     return signature(data) .. "-" .. current_time .. "-" .. difficulty
 end
 
 -- Verify challenge signature and extract difficulty
 -- Returns: is_valid, extracted_difficulty, timestamp
-local function verify_challenge(challenge, remote_addr, host)
+local function verify_challenge(challenge, remote_addr, host, uri)
     local sig, tstamp, difficulty = challenge:match("^(.+)-(%d+)-(%d+)$")
     if not sig or not tstamp or not difficulty then
         return false, nil, nil
@@ -236,7 +256,7 @@ local function verify_challenge(challenge, remote_addr, host)
     difficulty = tonumber(difficulty)
     
     -- Recreate expected signature
-    local data = remote_addr .. ":" .. host .. ":" .. tstamp .. ":" .. difficulty .. ":" .. config.secret
+    local data = remote_addr .. ":" .. host .. ":" .. uri .. ":" .. tstamp .. ":" .. difficulty .. ":" .. config.secret
     local expected_sig = signature(data)
     
     if sig ~= expected_sig then
@@ -290,11 +310,6 @@ end
 
 -- Main logic is a function that either returns to continue the lua_block in nginx or returns an error response
 function _M.check(custom_difficulty)
-    -- Common locations and files to always bypass
-    if ngx_var.uri:match("^/%.well%-known/") or ngx_var.uri:match("^/robots%.txt") or ngx_var.uri:match("^/ads%.txt") or ngx_var.uri:match("^/favicon%.ico") then
-        return
-    end
-
     -- Require the shared dict due to numerous dependencies
     if not rate_limit_dict then
         ngx_log(WARN, "[PoW] CRITICAL: Shared dict 'pow_rate_limit' not configured!")
@@ -305,15 +320,31 @@ function _M.check(custom_difficulty)
     local pow_difficulty = math_max(1, math_min(6, custom_difficulty or 3))  -- Clamp configured difficulty to safe range (1-6)
     local remote_addr = get_client_ip()
     local current_time = ngx_time()
-    local time_bucket = math_floor(tonumber(current_time) / tonumber(config.expire_time))
+    local expire_ts = current_time + config.expire_time
+    -- local time_bucket = math_floor(tonumber(current_time) / tonumber(config.expire_time))
     local host = ngx_var.host
+    local uri = ngx_var.uri
 
-    -- Cookie check (unique per client, per hostname). Removed cookie_exp, the token is either valid within the time bucket, or it's not.
-    local cookie_token = "_pow_" .. signature(remote_addr .. host .. "token"):sub(1, 8)
+    -- Common locations and files to always bypass
+    if uri:match("^/%.well%-known/") or uri:match("^/robots%.txt") or uri:match("^/ads%.txt") or uri:match("^/favicon%.ico") then
+        return
+    end
+
+    -- Cookie check (unique per client, per hostname).
+    local hashed_name = signature(remote_addr .. host .. "token"):sub(1, 8)
+    local cookie_token = "_pow_" .. hashed_name
+    local cookie_exp = "_exp_" .. hashed_name
+
     local token = ngx_var["cookie_" .. cookie_token] or ""
-    local expected_token = signature(remote_addr .. host .. config.secret .. time_bucket)
-    if token == expected_token then
-        return  -- Valid session, allow request
+    local exp = tonumber(ngx_var["cookie_" .. cookie_exp]) or 0
+
+    -- If exp has been tampered with then the expected token will be different and fail validation.
+    if exp > current_time and exp <= expire_ts then
+        -- Recreate expected signature
+        local expected_token = signature(remote_addr .. host .. exp .. config.secret)
+        if token == expected_token then
+            return  -- Valid session
+        end
     end
 
     -- 3 Phase test below: Greet, Challenge, Verify
@@ -326,11 +357,18 @@ function _M.check(custom_difficulty)
         local nonce = headers["x-pow-nonce"]
         local solve_time = tonumber(headers["x-pow-time"]) or 0  -- Client processing time, just used for logging
 
+        -- Type validation
+        if type(challenge) ~= "string" or type(nonce) ~= "string" then
+            ngx.status = 403
+            ngx_say("Invalid Response")
+            return ngx_exit(403)
+        end
+
         -- Rate limiting check
         local rate_count = check_rate_limit(remote_addr)
 
         -- Verify challenge signature and extract server-signed difficulty
-        local challenge_valid, server_difficulty, tstamp = verify_challenge(challenge, remote_addr, host)
+        local challenge_valid, server_difficulty, tstamp = verify_challenge(challenge, remote_addr, host, uri)
         
         if not challenge_valid then
             log_challenge("INVALID_CHALLENGE", remote_addr, {
@@ -406,10 +444,7 @@ function _M.check(custom_difficulty)
                 return ngx_exit(403)
             end
 
-            -- Issue new session token
-            local expire_ts = current_time + config.expire_time
-            local new_token = signature(remote_addr .. host .. config.secret .. time_bucket)
-            
+            -- Everything is valid and legit, let's issue new session tokens
             log_challenge("VERIFIED", remote_addr, {
                 nonce = nonce,
                 hash_prefix = hash:sub(1, 8),
@@ -418,8 +453,12 @@ function _M.check(custom_difficulty)
                 rate_count = rate_count
             })
 
+            -- Allow flexibility for dev implementation that might not have SSL. Assume prod server will always redirect to SSL.
+            local secure_flag = (ngx_var.scheme == "https") and "; Secure" or ""
+            local new_token = signature(remote_addr .. host .. expire_ts .. config.secret)
             ngx_header["Set-Cookie"] = {
-                cookie_token .. "=" .. new_token .. "; path=/; Max-Age=" .. config.expire_time .. "; SameSite=Lax; HttpOnly",
+                cookie_token .. "=" .. new_token .. "; path=/; Max-Age=" .. config.expire_time .. "; SameSite=Lax; HttpOnly" .. secure_flag,
+                cookie_exp .. "=" .. expire_ts .. "; path=/; Max-Age=" .. config.expire_time .. "; SameSite=Lax; HttpOnly" .. secure_flag
             }
             ngx.status = 204
             return ngx_exit(204)
@@ -442,7 +481,7 @@ function _M.check(custom_difficulty)
         local rate_count = check_rate_limit(remote_addr)
 
         -- Verify client timing (prevent immediate replies)
-        local ts_key = "pow_ts:" .. remote_addr
+        local ts_key = "pow_ts:" .. ngx_md5(remote_addr .. ":" .. host .. ":" .. uri)
         local ts_start = rate_limit_dict:get(ts_key)
 
         if ts_start then
@@ -454,9 +493,7 @@ function _M.check(custom_difficulty)
                     client_suspicion = client_suspicion,
                     rate_count = rate_count
                 })
-                -- We need to create some unique token to tie the timer to the check before penalizing.
-                -- Issue is when browser requests multiple pages at once we don't know which is which.
-                -- client_suspicion = client_suspicion + 2
+                client_suspicion = client_suspicion + 1
             end
         else
             -- Challenge expired or never started
@@ -474,7 +511,7 @@ function _M.check(custom_difficulty)
         local effective_difficulty = math_min(pow_difficulty + math_floor((server_suspicion + client_suspicion) / 2), 7)
 
         -- Generate new challenge with embedded difficulty
-        local challenge = generate_challenge(remote_addr, host, effective_difficulty, current_time)
+        local challenge = generate_challenge(remote_addr, host, uri, effective_difficulty, current_time)
         log_challenge("ISSUED", remote_addr, { 
             base_difficulty = pow_difficulty, 
             server_suspicion = server_suspicion,
@@ -490,7 +527,7 @@ function _M.check(custom_difficulty)
         -- Phase 1: Initial request - Greet with challenge page
 
         -- Generate initial low TTL simple session token for tracking reply timing
-        rate_limit_dict:set("pow_ts:" .. remote_addr, ngx_now(), 15)  -- reset TTL each new challenge
+        rate_limit_dict:set("pow_ts:" .. ngx_md5(remote_addr .. ":" .. host .. ":" .. uri), ngx_now(), 15)
 
         -- NOTE: Cloudflare uses 403 on their anti-bot page as they found 503 could confuse legitimate clients and some browsers. So that's what we use.
         -- Comments in JavaScript will get stripped out before sending to the browser.
@@ -841,13 +878,13 @@ function _M.check(custom_difficulty)
             // Otherwise adjust time in Phase 2 to prevent a TIMING_VIOLATION.
 
             status('Loading tests and analyzing browser...');
-            await new Promise(resolve => setTimeout(resolve, 1000));
+            await new Promise(resolve => setTimeout(resolve, Math.random() * 300 + 700));  // 700-1000ms
 
             status('Just hang on. We are almost there...');
-            await new Promise(resolve => setTimeout(resolve, 500));
+            await new Promise(resolve => setTimeout(resolve, Math.random() * 300 + 400));  // 400-700ms
 
             status('Fetching challenge...');
-            await new Promise(resolve => setTimeout(resolve, 200));
+            await new Promise(resolve => setTimeout(resolve, Math.random() * 300 + 200));  // 200-500ms
 
             // Run client tests and get suspicion score
             const clientSuspicion = detectClientSuspicion();
