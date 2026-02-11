@@ -56,7 +56,7 @@ http {
                 difficulty = difficulty + 1
             end
 
-            local pow = require("pow_ddos_challenge")
+            local pow = require("pow_gatekeeper")
             pow.check(difficulty)
 
             -- If check() hits a valid session, it simply returns and we reach here.
