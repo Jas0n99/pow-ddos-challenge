@@ -10,8 +10,8 @@
     Custom fork by: Jas0n99
     https://github.com/Jas0n99/pow-ddos-challenge
 
-    Version: 1.1.3
-    Last Updated: 2026-01-22
+    Version: 1.1.4
+    Last Updated: 2026-03-08
 
     Security Features:
     - SHA256 proof-of-work with configurable difficulty (1-7)
@@ -136,43 +136,53 @@ local function detect_server_suspicion(headers)
         score = score + 2
     end
     
-    -- Missing Accept-Encoding (all real browsers send this), or just gzip
+    -- Missing Accept-Encoding or missing brotli support
     local ae = headers["accept-encoding"]
-    if type(ae) ~= "string" or ae:lower() == "gzip" or ae:lower() == "gzip, deflate" then
+    if type(ae) ~= "string" or ae == "" then
+        score = score + 2
+    elseif not ae:match("br") then
         score = score + 1
     end
     
     -- Missing or suspicious User-Agent
     local ua = headers["user-agent"]
-    if type(ua) == "string" then
-        if ua == "" then
-            score = score + 3
-        elseif ua:match("^curl") or ua:match("^wget") or ua:match("^python") 
-               or ua:match("^Go%-http") or ua:match("^Java") or ua:match("^Ruby")
-               or ua:match("bot") or ua:match("Bot") or ua:match("crawler") 
-               or ua:match("spider") or ua:match("scraper") then
-            score = score + 2
-        end
-    else
-        -- Not a string (nil, table, etc) - missing UA is very suspicious
-        score = score + 2
+    local ua_str = type(ua) == "string" and ua or ""
 
+    if ua_str == "" then
+        score = score + 2
         -- Missing UA and Referer is even more suspicious
         if not headers["referer"] then
             score = score + 2
         end
+    elseif ua_str:match("^curl") or ua_str:match("^wget") or ua_str:match("^python")
+        or ua_str:match("^Go%-http") or ua_str:match("^Java") or ua_str:match("^Ruby")
+        or ua_str:match("[Bb]ot") or ua_str:match("[Cc]rawler")
+        or ua_str:match("[Ss]pider") or ua_str:match("[Ss]craper") then
+        score = score + 2
     end
     
-    -- Missing Sec-Fetch headers (modern browsers always send these)
-    if not headers["sec-fetch-mode"] 
-        or not headers["sec-fetch-site"]
-        or not headers["sec-fetch-dest"]
-        or not headers["sec-ch-ua"]
-        or not headers["sec-ch-ua-mobile"]
-        or not headers["sec-ch-ua-platform"]
-    then
-        -- Could be older browser, minor penalty
+    -- Missing Sec-Fetch headers (Chrome, Firefox, Edge all send these)
+    if not headers["sec-fetch-mode"] or not headers["sec-fetch-site"] or not headers["sec-fetch-dest"] then
+        score = score + 2
+    end
+
+    local is_chromium = ua_str:match("Chrome/") and not ua_str:match("Firefox/")
+    local is_firefox = ua_str:match("Firefox/")
+    local is_safari = ua_str:match("Safari/") and not ua_str:match("Chrome/")
+
+    -- Chromium UA but missing Sec-CH-UA headers is suspicious
+    if is_chromium then
+        if not headers["sec-ch-ua"] or not headers["sec-ch-ua-mobile"] or not headers["sec-ch-ua-platform"] then
+            score = score + 2
+        end
+    elseif headers["sec-fetch-mode"] and not is_firefox and not is_safari then
+        -- Has Sec-Fetch but unknown browser type - mildly suspicious
         score = score + 1
+    end
+
+    -- Firefox/Safari never send Sec-CH-UA, likely spoofed UA if present
+    if (is_firefox or is_safari) and headers["sec-ch-ua"] then
+        score = score + 2
     end
 
     -- Missing Accept header
@@ -323,7 +333,7 @@ function _M.check(custom_difficulty)
     local expire_ts = current_time + config.expire_time
     -- local time_bucket = math_floor(tonumber(current_time) / tonumber(config.expire_time))
     local host = ngx_var.host
-    local uri = ngx_var.uri
+    local uri = ngx_var.request_uri
 
     -- Common locations and files to always bypass
     if uri:match("^/%.well%-known/") or uri:match("^/robots%.txt") or uri:match("^/ads%.txt") or uri:match("^/favicon%.ico") then
@@ -486,7 +496,7 @@ function _M.check(custom_difficulty)
 
         if ts_start then
             local ts_elapsed = ngx_now() - ts_start
-            if ts_elapsed < 1 then
+            if ts_elapsed < 2 then
                 -- Penalize by adding to their suspicion score
                 log_challenge("TIMING_VIOLATION", remote_addr, {
                     ts_elapsed = ts_elapsed,
@@ -881,10 +891,10 @@ function _M.check(custom_difficulty)
             await new Promise(resolve => setTimeout(resolve, Math.random() * 300 + 700));  // 700-1000ms
 
             status('Just hang on. We are almost there...');
-            await new Promise(resolve => setTimeout(resolve, Math.random() * 300 + 400));  // 400-700ms
+            await new Promise(resolve => setTimeout(resolve, Math.random() * 300 + 700));  // 700-1000ms
 
             status('Fetching challenge...');
-            await new Promise(resolve => setTimeout(resolve, Math.random() * 300 + 200));  // 200-500ms
+            await new Promise(resolve => setTimeout(resolve, Math.random() * 300 + 700));  // 700-1000ms
 
             // Run client tests and get suspicion score
             const clientSuspicion = detectClientSuspicion();
