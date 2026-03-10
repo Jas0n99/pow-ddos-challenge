@@ -10,8 +10,8 @@
     Custom fork by: Jas0n99
     https://github.com/Jas0n99/pow-ddos-challenge
 
-    Version: 1.1.4
-    Last Updated: 2026-03-08
+    Version: 1.1.5
+    Last Updated: 2026-03-09
 
     Security Features:
     - SHA256 proof-of-work with configurable difficulty (1-7)
@@ -333,7 +333,7 @@ function _M.check(custom_difficulty)
     local expire_ts = current_time + config.expire_time
     -- local time_bucket = math_floor(tonumber(current_time) / tonumber(config.expire_time))
     local host = ngx_var.host
-    local uri = ngx_var.request_uri
+    local uri = ngx_var.request_uri or ngx_var.uri or "/"
 
     -- Common locations and files to always bypass
     if uri:match("^/%.well%-known/") or uri:match("^/robots%.txt") or uri:match("^/ads%.txt") or uri:match("^/favicon%.ico") then
