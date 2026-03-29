@@ -10,8 +10,8 @@
     Custom fork by: Jas0n99
     https://github.com/Jas0n99/pow-ddos-challenge
 
-    Version: 1.1.5
-    Last Updated: 2026-03-09
+    Version: 1.1.6
+    Last Updated: 2026-03-29
 
     Security Features:
     - SHA256 proof-of-work with configurable difficulty (1-7)
@@ -786,9 +786,9 @@ function _M.check(custom_difficulty)
                 const vendor = gl.getParameter(gl.VENDOR);
                 const renderer = gl.getParameter(gl.RENDERER);
                 // Headless Chrome often uses SwiftShader
-                if (renderer && renderer.includes('SwiftShader')) { score += 4; reasons.push(`${score} (SwiftShader)`); }
+                if (renderer && renderer.includes('SwiftShader')) { score += 2; reasons.push(`${score} (SwiftShader)`); }
                 // VMware/VirtualBox fingerprints
-                if (vendor && (vendor.includes('VMware') || renderer.includes('llvmpipe'))) { score += 4; reasons.push(`${score} (VM detected)`); }
+                if (vendor && (vendor.includes('VMware') || renderer.includes('llvmpipe'))) { score += 1; reasons.push(`${score} (VM detected)`); }
             }
 
             // Mouse/touch interaction checks (only penalize suspicious patterns, not absence)
