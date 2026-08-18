@@ -10,8 +10,8 @@
     Custom fork by: Jas0n99
     https://github.com/Jas0n99/pow-ddos-challenge
 
-    Version: 1.1.6
-    Last Updated: 2026-03-29
+    Version: 1.1.8
+    Last Updated: 2026-07-13
 
     Security Features:
     - SHA256 proof-of-work with configurable difficulty (1-7)
@@ -161,7 +161,7 @@ local function detect_server_suspicion(headers)
         score = score + 2
     end
     
-    -- Missing Sec-Fetch headers (Chrome, Firefox, Edge all send these)
+    -- Missing Sec-Fetch headers (Chrome, Firefox, Edge, Safari all send these)
     if not headers["sec-fetch-mode"] or not headers["sec-fetch-site"] or not headers["sec-fetch-dest"] then
         score = score + 2
     end
@@ -496,7 +496,7 @@ function _M.check(custom_difficulty)
 
         if ts_start then
             local ts_elapsed = ngx_now() - ts_start
-            if ts_elapsed < 2 then
+            if ts_elapsed < 1 then
                 -- Penalize by adding to their suspicion score
                 log_challenge("TIMING_VIOLATION", remote_addr, {
                     ts_elapsed = ts_elapsed,
@@ -710,8 +710,9 @@ function _M.check(custom_difficulty)
             // Browser inconsistency checks (bots often get these wrong)
             const ua = navigator.userAgent;
             if (ua.includes('Chrome') && !window.chrome) { score += 1; reasons.push(`${score} (Chrome mismatch)`); }  // Claims Chrome (or Edg) but no chrome object
-            if (ua.includes('Firefox') && typeof InstallTrigger === 'undefined') { score += 1; reasons.push(`${score} (Firefox mismatch)`); }  // Claims Firefox but missing
-            if ( (/\bIntel Mac OS X\b|\bCPU (?:iPhone |iPad )?OS\b/.test(ua)) && ua.includes('Safari') && !/Chrome|Edg|Firefox/.test(ua) && !window.safari ) { score += 1; reasons.push(`${score} (Safari mismatch)`); }  // Claims Safari but missing
+            if (ua.includes('Firefox') && !('MozAppearance' in document.documentElement.style)) { score += 1; reasons.push(`${score} (Firefox mismatch)`); }  // Claims Firefox but missing Moz-prefixed CSS
+//            if (ua.includes('Firefox') && typeof InstallTrigger === 'undefined') { score += 1; reasons.push(`${score} (Firefox mismatch)`); }  // Claims Firefox but missing
+//            if ( (/\bIntel Mac OS X\b|\bCPU (?:iPhone |iPad )?OS\b/.test(ua)) && ua.includes('Safari') && !/Chrome|Edg|Firefox/.test(ua) && !window.safari ) { score += 1; reasons.push(`${score} (Safari mismatch)`); }  // Claims Safari but missing
 
             // Bots fake 1-2 cores, humans 4-16+
             if(navigator.hardwareConcurrency <= 1) { score += 1; reasons.push(`${score} (Low cores)`); }
@@ -760,7 +761,7 @@ function _M.check(custom_difficulty)
             if (!navigator.mediaDevices) { score += 1; reasons.push(`${score} (No media)`); }
 
             // Notification API (often missing in headless)
-            if (!window.Notification) { score += 1; reasons.push(`${score} (No notifications)`); }
+            if (!window.Notification && !(/iPad|iPhone|iPod/.test(ua) || (ua.includes('Macintosh') && navigator.maxTouchPoints > 1))) { score += 1; reasons.push(`${score} (No notifications)`); }  // Missing in headless, but iOS Safari never has it
 
             // Broken Error.stack format (bots often have wrong stack traces)
             try {
@@ -890,8 +891,8 @@ function _M.check(custom_difficulty)
             status('Loading tests and analyzing browser...');
             await new Promise(resolve => setTimeout(resolve, Math.random() * 300 + 700));  // 700-1000ms
 
-            status('Just hang on. We are almost there...');
-            await new Promise(resolve => setTimeout(resolve, Math.random() * 300 + 700));  // 700-1000ms
+            // status('Just hang on. We are almost there...');
+            // await new Promise(resolve => setTimeout(resolve, Math.random() * 300 + 700));  // 700-1000ms
 
             status('Fetching challenge...');
             await new Promise(resolve => setTimeout(resolve, Math.random() * 300 + 700));  // 700-1000ms
